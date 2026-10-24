@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#17212d" id="themeColor">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Agentic Compendium">
+  <meta name="description" content="Private channels and personal notes for Hermes deliveries">
+  <link rel="manifest" href="/app/manifest.webmanifest">
+  <link rel="icon" type="image/png" href="/app/icon-192.png">
+  <link rel="apple-touch-icon" href="/app/icon-192.png">
+  <link rel="stylesheet" href="/app/styles.css">
+  <title>Agentic Compendium</title>
+</head>
+<body>
+  <section id="login" class="login-screen">
+    <form id="loginForm" class="login-card">
+      <img class="logomark" src="/app/icon-192.png" alt="Agentic Compendium logo" width="57" height="57">
+      <p class="eyebrow">PRIVATE WORKSPACE</p>
+      <h1>Agentic Compendium</h1>
+      <p class="muted">Your Hermes deliveries, organised on your devices.</p>
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" autocomplete="username" value="owner" required>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required>
+      <button type="submit" class="primary">Sign in</button>
+      <p id="loginMessage" class="error" role="alert"></p>
+      <p class="small muted">Sign in over your private LAN or VPN HTTPS address.</p>
+    </form>
+  </section>
+
+  <main id="workspace" class="workspace hidden" data-view="list">
+    <header class="topbar">
+      <div class="brand">
+        <img class="logomark mini" src="/app/icon-192.png" alt="" width="37" height="37">
+        <div><strong>Agentic Compendium</strong><small>PRIVATE ARCHIVE</small></div>
+      </div>
+      <div class="header-actions">
+        <span id="connectivity" class="connection-dot" role="status">Checking sync</span>
+        <button id="toggleChannels" type="button" aria-controls="channels" aria-expanded="true" title="Show or hide channels">Channels</button>
+        <button id="toggleList" type="button" aria-controls="deliveryList" aria-expanded="true" title="Show or hide delivery list">List</button>
+        <button id="refresh" type="button" title="Sync deliveries">Sync</button>
+        <button id="openSettings" type="button" title="Open settings">Settings</button>
+      </div>
+    </header>
+    <nav class="mobile-tabs" aria-label="Panels">
+      <button data-panel="channels">Channels</button><button data-panel="list">Deliveries</button><button data-panel="reader">Reader</button>
+    </nav>
+    <div class="panels">
+      <aside class="channels panel" aria-label="Channels">
+        <div class="panel-title"><span>YOUR CHANNELS</span><div class="sidebar-heading-actions"><button id="newSection" type="button" title="Create section">+ Section</button><button id="newChannel" type="button" title="Create channel">+ Channel</button></div></div>
+        <div id="channels" class="channel-list"></div>
+        <div class="sidebar-footer"><a href="https://buymeacoffee.com/muhdusama" target="_blank" rel="noopener noreferrer">Buy me a coffee</a><span>Developed and maintained by <a href="https://imuverse.com" target="_blank" rel="noopener noreferrer">IMUVERSE</a></span></div>
+      </aside>
+      <section class="deliveries panel" aria-label="Deliveries">
+        <div class="list-heading"><div><span class="eyebrow" id="selectionLabel">LIBRARY</span><h2 id="listTitle">All deliveries</h2></div><div class="list-heading-actions"><span id="deliveryCount" class="counter">0</span><button type="button" id="selectMode" aria-pressed="false">Select</button></div></div>
+        <label class="search-label"><span class="visually-hidden">Search deliveries</span><input id="search" type="search" placeholder="Search your archive…"></label>
+        <div id="bulkActions" class="bulk-actions hidden" aria-label="Selected delivery actions">
+          <div class="bulk-top"><strong id="selectedCount" aria-live="polite">0 selected</strong><button id="selectAll" type="button">Select all</button><button id="clearSelection" type="button">Clear</button></div>
+          <div class="bulk-row"><label class="visually-hidden" for="bulkChannel">Destination channel</label><select id="bulkChannel"><option value="">Choose channel</option></select><button id="bulkMove" type="button">Move</button></div>
+          <div class="bulk-row"><button id="bulkRead" type="button">Mark read</button><button id="bulkUnread" type="button">Unread</button><button id="bulkDelete" class="subtle-danger" type="button">Move to Bin</button><button id="bulkRestore" type="button" class="hidden">Restore</button></div>
+        </div>
+        <div id="deliveryList" class="delivery-list"></div>
+      </section>
+      <article class="reader panel" aria-label="Reader" id="reader">
+        <div id="emptyReader" class="empty-reader"><div class="empty-symbol">✳</div><h2>Room to think.</h2><p>Choose a delivery to read, organise or annotate.</p></div>
+        <div id="readerContent" class="hidden">
+          <div class="reader-top"><span id="readerPublisher" class="eyebrow"></span><span id="readerDate" class="muted"></span></div>
+          <h1 id="readerTitle"></h1>
+          <div id="readerSummary" class="reader-summary rich-text"></div>
+          <div class="reader-actions"><label>File in <select id="readerChannel"></select></label><button id="toggleRead" type="button">Mark unread</button><button id="downloadRTF" type="button" title="Export formatted text as an RTF document">Export RTF</button><button id="hideDelivery" type="button" class="subtle-danger">Move to Bin</button></div>
+          <section class="reader-body rich-text" id="readerBody" aria-label="Formatted delivery content"></section>
+          <section class="notes-section"><div class="notes-heading"><h3>My typed notes</h3><span class="muted small">Synced privately</span></div><label class="visually-hidden" for="noteText">Personal notes</label><textarea id="noteText" rows="5" placeholder="Capture an idea, action or question…"></textarea></section>
+        </div>
+      </article>
+    </div>
+  </main>
+
+  <dialog id="settingsDialog" class="dialog">
+    <form method="dialog" class="dialog-top"><div><span class="eyebrow">YOUR SPACE</span><h2>Settings</h2></div><button aria-label="Close settings">Close</button></form>
+    <section><h3>Appearance</h3><p class="muted small">Choose a display mode and accent colour. Changes sync between your devices.</p>
+      <div class="appearance-controls"><label>Display mode<select id="themeMode"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+      <label>Accent colour<select id="accentColor"><option value="teal">Teal</option><option value="ocean">Ocean</option><option value="indigo">Indigo</option><option value="amber">Amber</option><option value="rose">Rose</option></select></label></div>
+      <div id="colourSwatches" class="colour-swatches" aria-label="Accent colour preview"></div>
+    </section>
+    <section><h3>Owner account</h3><p class="muted small">Change the Compendium username or password. All devices will need to sign in again after a change.</p>
+      <form id="accountForm" class="stacked"><label>Username<input id="accountUsername" type="text" minlength="3" maxlength="32" pattern="[A-Za-z][A-Za-z0-9._-]{2,31}" autocomplete="username" required></label>
+        <label>Current password<input id="accountCurrentPassword" type="password" autocomplete="current-password" required></label>
+        <label>New password (leave blank to keep existing)<input id="accountNewPassword" type="password" minlength="14" autocomplete="new-password"></label>
+        <label>Confirm new password<input id="accountConfirmPassword" type="password" autocomplete="new-password"></label>
+        <button class="primary" type="submit">Update account</button></form><p id="accountStatus" class="small" role="status"></p>
+    </section>
+    <section><h3>Hermes connection</h3><p class="muted small">Hermes continues to own job schedules. Compendium only imports completed runs for the jobs you enable.</p>
+      <form id="hermesForm" class="stacked">
+        <label>Server HTTPS URL<input id="hermesUrl" type="url" placeholder="https://hermes.example.com" required></label>
+        <label>Dashboard username<input id="hermesUser" type="text" autocomplete="username" required></label>
+        <label>Dashboard password<input id="hermesPass" type="password" autocomplete="new-password" required></label>
+        <label>Archive identity <select id="hermesSource"><option value="">New source</option></select></label>
+        <button type="submit" class="primary">Connect to Hermes</button>
+      </form><p id="hermesStatus" class="small muted"></p>
+      <div id="hermesJobs"></div>
+    </section>
+    <section><h3>Native app migration</h3><p class="muted small">Import the JSON archive exported by the native app. Data is merged without overwriting existing records. Original PencilKit data remains intact, with viewable PNG previews.</p>
+      <label class="import-field">Choose archive<input type="file" id="importFile" accept=".json,application/json"></label><button id="importButton" type="button">Import archive</button><p id="importStatus" class="small muted"></p>
+    </section>
+    <section><h3>Privacy & access</h3><p class="small muted">This PWA uses a private owner session, a single SQLite database and device-local offline cache. Signing out does not remove this device's offline cache. Avoid using shared devices. The native app is not replaced or deleted.</p>
+      <button id="resolveConflicts" type="button">Review pending conflicts</button>
+      <button id="logout" type="button">Sign out</button>
+    </section>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app/rich-text.js" defer></script>
+  <script src="/app/app.js" defer></script>
+</body>
+</html>

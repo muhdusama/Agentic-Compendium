@@ -1,0 +1,14 @@
+.git/
+.github/
+.env
+.env.*
+!.env.example
+data/
+backups/
+server/tests/
+__pycache__/
+*.pyc
+.DS_Store
+._*
+node_modules/
+*.sqlite*

@@ -1,0 +1,31 @@
+services:
+  delivery-service:
+    build: .
+    image: agentic-compendium:latest
+    container_name: agentic-compendium-delivery
+    restart: unless-stopped
+    environment:
+      APP_DB_PATH: /data/deliveries.sqlite3
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8790"
+      APP_READ_TOKEN: ${APP_READ_TOKEN:?set a random read token in .env}
+      APP_PUBLISH_TOKEN: ${APP_PUBLISH_TOKEN:?set a separate random publish token in .env}
+      APP_OWNER_PASSWORD: ${APP_OWNER_PASSWORD:?set a random owner password in .env}
+      APP_PUBLIC_ORIGIN: ${APP_PUBLIC_ORIGIN:?set your HTTPS app origin in .env}
+      APP_HERMES_ALLOWED_ORIGINS: ${APP_HERMES_ALLOWED_ORIGINS:-}
+      APP_HERMES_POLL_SECONDS: ${APP_HERMES_POLL_SECONDS:-300}
+    ports:
+      - "${APP_BIND_IP:-127.0.0.1}:8790:8790"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/healthz', timeout=2).read()"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
