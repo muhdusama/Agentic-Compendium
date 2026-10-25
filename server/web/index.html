@@ -45,6 +45,7 @@
         <button id="openSettings" type="button" title="Open settings">Settings</button>
       </div>
     </header>
+    <button id="reviewConflicts" type="button" class="hidden sync-alert">Review conflicts</button>
     <nav class="mobile-tabs" aria-label="Panels">
       <button data-panel="channels">Channels</button><button data-panel="list">Deliveries</button><button data-panel="reader">Reader</button>
     </nav>
@@ -72,7 +73,7 @@
           <div id="readerSummary" class="reader-summary rich-text"></div>
           <div class="reader-actions"><label>File in <select id="readerChannel"></select></label><button id="toggleRead" type="button">Mark unread</button><button id="downloadRTF" type="button" title="Export formatted text as an RTF document">Export RTF</button><button id="hideDelivery" type="button" class="subtle-danger">Move to Bin</button></div>
           <section class="reader-body rich-text" id="readerBody" aria-label="Formatted delivery content"></section>
-          <section class="notes-section"><div class="notes-heading"><h3>My typed notes</h3><span class="muted small">Synced privately</span></div><label class="visually-hidden" for="noteText">Personal notes</label><textarea id="noteText" rows="5" placeholder="Capture an idea, action or question…"></textarea></section>
+          <section class="notes-section"><div class="notes-heading"><h3>My typed notes</h3><span id="noteStatus" class="muted small" role="status">Saved</span></div><label class="visually-hidden" for="noteText">Personal notes</label><textarea id="noteText" rows="5" placeholder="Capture an idea, action or question…"></textarea></section>
         </div>
       </article>
     </div>
@@ -102,13 +103,20 @@
       </form><p id="hermesStatus" class="small muted"></p>
       <div id="hermesJobs"></div>
     </section>
-    <section><h3>Native app migration</h3><p class="muted small">Import the JSON archive exported by the native app. Data is merged without overwriting existing records. Original PencilKit data remains intact, with viewable PNG previews.</p>
-      <label class="import-field">Choose archive<input type="file" id="importFile" accept=".json,application/json"></label><button id="importButton" type="button">Import archive</button><p id="importStatus" class="small muted"></p>
+    <section><h3>Portable archive</h3><p class="muted small">Download your deliveries, notes, channels and original imported archives. Credentials are excluded. Import a PWA archive (up to 256 MiB) or native app archive (up to 64 MiB); conflicting records are never overwritten. Keep downloads private.</p>
+      <button id="exportArchive" type="button">Export archive</button><label class="import-field">Choose archive<input type="file" id="importFile" accept=".json,application/json"></label><button id="importButton" type="button">Import archive</button><p id="importStatus" class="small muted" role="status"></p>
     </section>
     <section><h3>Privacy & access</h3><p class="small muted">This PWA uses a private owner session, a single SQLite database and device-local offline cache. Signing out does not remove this device's offline cache. Avoid using shared devices. The native app is not replaced or deleted.</p>
       <button id="resolveConflicts" type="button">Review pending conflicts</button>
       <button id="logout" type="button">Sign out</button>
     </section>
+  </dialog>
+  <dialog id="conflictDialog" class="dialog">
+    <form method="dialog" class="dialog-top"><h2 id="conflictTitle">Sync conflict</h2><button aria-label="Close conflict review">Close</button></form>
+    <p>Another device changed this item. Download your draft before choosing the synced version if you want to keep a copy.</p>
+    <h3>Your draft</h3><pre id="localConflict" class="conflict-preview"></pre>
+    <h3>Synced version</h3><pre id="remoteConflict" class="conflict-preview"></pre>
+    <div class="conflict-actions"><button id="exportConflict" type="button">Download my draft</button><button id="keepLocal" type="button">Keep my version</button><button id="keepRemote" type="button">Use synced version</button></div>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/app/rich-text.js" defer></script>

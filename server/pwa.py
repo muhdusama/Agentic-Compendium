@@ -24,7 +24,7 @@ from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from server.app import ConflictError, ValidationError, validate_delivery
+from server.app import ConflictError, ValidationError, canonical_delivery_json, validate_delivery
 from server.hermes import HermesAdapter, HermesError, checked_hermes_origin
 
 STATE_KINDS = {"channel", "section", "note", "route", "job", "placement", "hidden-delivery",
@@ -33,7 +33,12 @@ KEY = re.compile(r"^[A-Za-z0-9._:@|/-]{1,250}$")
 OWNER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{2,31}$")
 PASSWORD_ITERATIONS = 600_000
 MAX_STATE_BODY = 4 * 1024 * 1024
+# Native exports retain 64 MiB; base64 PWA envelopes have a bounded larger limit.
 MAX_IMPORT_BODY = 64 * 1024 * 1024
+MAX_PWA_ARCHIVE_BODY = 256 * 1024 * 1024
+MAX_FAILED_LOGIN_IPS = 1024
+LOGIN_FAILURE_WINDOW = 300
+LOGIN_FAILURE_LIMIT = 8
 STATIC = {
     "/app/": ("index.html", "text/html; charset=utf-8"),
     "/app/app.js": ("app.js", "application/javascript; charset=utf-8"),
@@ -62,7 +67,7 @@ def checked_record(value):
         raise ValidationError("invalid record")
     source = checked_string(value["sourceId"], "sourceId")
     kind = value["kind"]
-    if kind not in STATE_KINDS:
+    if not isinstance(kind, str) or kind not in STATE_KINDS:
         raise ValidationError("invalid kind")
     key = checked_string(value["key"], "key")
     version = value["baseVersion"]
@@ -260,11 +265,20 @@ class PersonalState:
                        (hashlib.sha256(token.encode()).hexdigest(),))
 
     def import_archive(self, contents):
-        digest = hashlib.sha256(contents).hexdigest()
+        if not isinstance(contents, (bytes, bytearray)):
+            raise ValidationError("invalid portable archive")
+        contents = bytes(contents)
+        if len(contents) > MAX_PWA_ARCHIVE_BODY:
+            raise ValidationError("portable archive exceeds the PWA import limit")
         try:
             payload = json.loads(contents)
         except (ValueError, UnicodeDecodeError) as exc:
             raise ValidationError("invalid portable archive") from exc
+        if isinstance(payload, dict) and payload.get("format") == "agentic-compendium-pwa":
+            return self._import_pwa_archive(payload)
+        if len(contents) > MAX_IMPORT_BODY:
+            raise ValidationError("native archive exceeds the import limit")
+        digest = hashlib.sha256(contents).hexdigest()
         if not isinstance(payload, dict) or payload.get("version") != 1:
             raise ValidationError("unsupported portable archive version")
         files, prefs, previews = payload.get("files"), payload.get("preferences"), payload.get("drawingPreviews")
@@ -430,6 +444,94 @@ class PersonalState:
                        (digest, contents))
         return {"imported": created, "alreadyImported": False}
 
+    def export_archive(self):
+        """Return only portable owner data from one SQLite read transaction."""
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN")
+            records = [self.as_record(row) for row in db.execute(
+                "SELECT * FROM app_state ORDER BY source_id,kind,record_key").fetchall()]
+            published = [json.loads(row["payload_json"]) for row in db.execute(
+                "SELECT payload_json FROM deliveries ORDER BY id").fetchall()]
+            native_archives = [{"digest": row["digest"], "contents": base64.b64encode(row["payload"]).decode()}
+                               for row in db.execute("SELECT digest,payload FROM app_native_archives ORDER BY digest").fetchall()]
+        archive = {"format": "agentic-compendium-pwa", "version": 1, "records": records,
+                   "published": published, "nativeArchives": native_archives}
+        if len(json_bytes(archive)) > MAX_PWA_ARCHIVE_BODY:
+            raise ValidationError("portable archive exceeds the PWA import limit")
+        return archive
+
+    def _import_pwa_archive(self, payload):
+        if set(payload) != {"format", "version", "records", "published", "nativeArchives"}:
+            raise ValidationError("invalid PWA archive")
+        if payload["version"] != 1 or not all(isinstance(payload[name], list)
+                                                for name in ("records", "published", "nativeArchives")):
+            raise ValidationError("unsupported PWA archive version")
+        records = {}
+        for item in payload["records"]:
+            if not isinstance(item, dict) or set(item) != {"sourceId", "kind", "key", "version", "deleted", "value"}:
+                raise ValidationError("invalid PWA record")
+            source, kind, key, version, deleted, value = checked_record({
+                "sourceId": item["sourceId"], "kind": item["kind"], "key": item["key"],
+                "baseVersion": item["version"], "deleted": item["deleted"], "value": item["value"]})
+            if version < 1:
+                raise ValidationError("invalid PWA record version")
+            index = (source, kind, key)
+            if index in records:
+                raise ValidationError("duplicate PWA record")
+            records[index] = (deleted, value)
+        published = {}
+        for item in payload["published"]:
+            delivery = validate_delivery(item)
+            if delivery["id"] in published:
+                raise ValidationError("duplicate published delivery")
+            published[delivery["id"]] = delivery
+        native_archives = {}
+        for item in payload["nativeArchives"]:
+            if not isinstance(item, dict) or set(item) != {"digest", "contents"}:
+                raise ValidationError("invalid native archive")
+            digest = item["digest"]
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValidationError("invalid native archive digest")
+            try:
+                raw = base64.b64decode(item["contents"], validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ValidationError("invalid native archive encoding") from exc
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise ValidationError("native archive checksum mismatch")
+            if digest in native_archives:
+                raise ValidationError("duplicate native archive")
+            native_archives[digest] = raw
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for (source, kind, key), (deleted, value) in records.items():
+                existing = db.execute("SELECT deleted,value_json FROM app_state WHERE source_id=? AND kind=? AND record_key=?",
+                                      (source, kind, key)).fetchone()
+                if existing and (bool(existing["deleted"]) != deleted or json.loads(existing["value_json"]) != value):
+                    raise ConflictError("archive conflicts with existing data; nothing imported")
+            for delivery_id, delivery in published.items():
+                existing = db.execute("SELECT payload_json FROM deliveries WHERE id=?", (delivery_id,)).fetchone()
+                if existing and json.loads(existing["payload_json"]) != delivery:
+                    raise ConflictError("archive conflicts with existing published delivery; nothing imported")
+            for digest, raw in native_archives.items():
+                existing = db.execute("SELECT payload FROM app_native_archives WHERE digest=?", (digest,)).fetchone()
+                if existing and existing["payload"] != raw:
+                    raise ConflictError("archive conflicts with existing native archive; nothing imported")
+            created = 0
+            for (source, kind, key), (deleted, value) in records.items():
+                if not db.execute("SELECT 1 FROM app_state WHERE source_id=? AND kind=? AND record_key=?",
+                                  (source, kind, key)).fetchone():
+                    self._upsert(db, source, kind, key, value, deleted, 1); created += 1
+            for delivery_id, delivery in published.items():
+                if not db.execute("SELECT 1 FROM deliveries WHERE id=?", (delivery_id,)).fetchone():
+                    db.execute("INSERT INTO deliveries(id,payload_json,updated_at) VALUES(?,?,?)",
+                               (delivery_id, canonical_delivery_json(delivery), time.time_ns())); created += 1
+            for digest, raw in native_archives.items():
+                if not db.execute("SELECT 1 FROM app_native_archives WHERE digest=?", (digest,)).fetchone():
+                    db.execute("INSERT OR IGNORE INTO app_imports(digest,imported_at) VALUES(?,?)",
+                               (digest, datetime.now(timezone.utc).isoformat()))
+                    db.execute("INSERT INTO app_native_archives(digest,payload) VALUES(?,?)", (digest, raw)); created += 1
+        return {"imported": created, "alreadyImported": created == 0}
+
 
 class OwnerWeb:
     def __init__(self, state, owner_password, public_origin, static_dir=None, hermes_allowed=None):
@@ -447,6 +549,7 @@ class OwnerWeb:
         self.allowed_hermes = set(hermes_allowed or [])
         self.auth_lock = threading.Lock()
         self.failed_logins = {}
+        self.hermes_probe_positions = {}
         self.poll_lock = threading.Lock()
 
     @staticmethod
@@ -467,6 +570,22 @@ class OwnerWeb:
         value = token or ""
         secure = "; Secure" if self.origin.startswith("https://") else ""
         return f"compendium_sid={value}; HttpOnly; SameSite=Strict; Path=/app/; Max-Age={43200 if token else 0}{secure}"
+
+    def _login_blocked(self, ip, now):
+        for address, failures in list(self.failed_logins.items()):
+            current = [stamp for stamp in failures if now - stamp < LOGIN_FAILURE_WINDOW]
+            if current:
+                self.failed_logins[address] = current
+            else:
+                self.failed_logins.pop(address, None)
+        failures = self.failed_logins.get(ip, [])
+        if len(failures) >= LOGIN_FAILURE_LIMIT:
+            return True
+        if ip not in self.failed_logins:
+            while len(self.failed_logins) >= MAX_FAILED_LOGIN_IPS:
+                oldest = min(self.failed_logins, key=lambda address: self.failed_logins[address][-1])
+                self.failed_logins.pop(oldest, None)
+        return False
 
     def _json(self, handler, code, data, cookie=None):
         body = json_bytes(data)
@@ -547,11 +666,15 @@ class OwnerWeb:
                     supplied = ""
                 with self.auth_lock:
                     ip = handler.client_address[0]
-                    blocked = [t for t in self.failed_logins.get(ip, []) if time.time() - t < 300]
-                    if len(blocked) >= 8 or not self.state.verify_owner(username, supplied):
-                        blocked.append(time.time())
-                        self.failed_logins[ip] = blocked
-                        self._json(handler, 429 if len(blocked) >= 8 else 401, {"error": "invalid sign-in"})
+                    now = time.time()
+                    if self._login_blocked(ip, now):
+                        self._json(handler, 429, {"error": "invalid sign-in"})
+                        return True
+                    if not self.state.verify_owner(username, supplied):
+                        failures = self.failed_logins.setdefault(ip, [])
+                        failures.append(now)
+                        self._json(handler, 429 if len(failures) >= LOGIN_FAILURE_LIMIT else 401,
+                                   {"error": "invalid sign-in"})
                         return True
                     self.failed_logins.pop(ip, None)
                 self._json(handler, 200, {"authenticated": True}, self._cookie(self.state.create_session()))
@@ -610,8 +733,10 @@ class OwnerWeb:
             cursor = query.get("cursor", [None])[0]
             deliveries, next_cursor, more = self.delivery_db.sync(cursor, 250)
             return self._json(handler, 200, {"deliveries": deliveries, "cursor": next_cursor, "hasMore": more})
+        if method == "GET" and path == "/app/api/export":
+            return self._json(handler, 200, self.state.export_archive())
         if method == "POST" and path == "/app/api/import":
-            raw = self._body_bytes(handler, MAX_IMPORT_BODY)
+            raw = self._body_bytes(handler, MAX_PWA_ARCHIVE_BODY)
             return self._json(handler, 200, self.state.import_archive(raw))
         if method == "GET" and path == "/app/api/hermes":
             return self._json(handler, 200, self._public_hermes())
@@ -631,6 +756,8 @@ class OwnerWeb:
             # do not silently infer identity from matching user names or URLs.
             self.state.set_config("hermes", {"url": endpoint, "username": user,
                                              "password": password, "sourceId": source})
+            self.hermes_probe_positions = {key: position for key, position in self.hermes_probe_positions.items()
+                                           if key[1] != source}
             self.state.put({"sourceId": source, "kind": "source", "key": "self",
                             "baseVersion": existing["version"] if existing else 0,
                             "deleted": False,
@@ -672,7 +799,13 @@ class OwnerWeb:
             if not enabled:
                 return {"imported": 0, "enabledJobs": 0}
             client = self.hermes(config)
-            return client.pull(self.state, config["sourceId"], enabled)
+            connection = (config["url"], config["sourceId"])
+            positions = {job_id: self.hermes_probe_positions[(connection[0], connection[1], job_id)]
+                         for job_id in enabled if (connection[0], connection[1], job_id) in self.hermes_probe_positions}
+            result = client.pull(self.state, config["sourceId"], enabled, positions)
+            for job_id, run_id in positions.items():
+                self.hermes_probe_positions[(connection[0], connection[1], job_id)] = run_id
+            return result
         finally:
             self.poll_lock.release()
 
@@ -682,6 +815,6 @@ class OwnerWeb:
                 time.sleep(interval)
                 try:
                     self.pull_hermes()
-                except (HermesError, ValidationError, OSError) as exc:
+                except (HermesError, ValidationError, OSError, sqlite3.Error) as exc:
                     print(f"Compendium Hermes poll failed: {type(exc).__name__}", flush=True)
         threading.Thread(target=loop, daemon=True, name="app01-hermes-poll").start()

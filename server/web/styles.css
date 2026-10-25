@@ -139,6 +139,11 @@ button.primary{background:var(--accent-ink);border-color:var(--accent-ink);color
 .rich-text hr{border:0;border-top:1px solid var(--line);margin:25px 0}
 
 /* Appearance controls. Colour options remain legible in light and dark modes. */
+.conflict-preview{white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto;background:var(--input-soft);padding:12px;border-radius:8px}
+.conflict-actions{display:flex;flex-wrap:wrap;gap:8px}
+.sync-alert{flex-shrink:0;margin:8px 12px;border-color:var(--accent);color:var(--accent-ink)}
+.notes-heading{flex-wrap:wrap;gap:8px}
+
 .appearance-controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .appearance-controls label{font-size:.79rem;font-weight:680;color:var(--soft-text)}
 .appearance-controls select{display:block;margin-top:6px;font-size:.86rem}

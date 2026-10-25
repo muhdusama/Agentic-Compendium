@@ -8,8 +8,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 TOP = {
-    ".dockerignore", ".env.example", ".gitignore", ".github/FUNDING.yml",
-    "Dockerfile", "compose.yaml", "LICENSE", "README.md", "scripts/check-publication.py",
+    ".dockerignore", ".env.example", ".gitignore", ".github/FUNDING.yml", ".github/workflows/ci.yml",
+    "Dockerfile", "compose.yaml", "LICENSE", "README.md", "scripts/check-publication.py", "scripts/browser-smoke.py",
     "server/__init__.py", "server/app.py", "server/hermes.py", "server/pwa.py",
     "server/tests/__init__.py", "server/tests/test_pwa.py",
     "server/tests/test_delivery_core.py", "server/tests/browser-smoke.cjs",

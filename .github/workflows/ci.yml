@@ -1,0 +1,40 @@
+name: Validate app
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Validate public source and Python regressions
+        run: |
+          python scripts/check-publication.py
+          python -m unittest discover -s server/tests -v
+          node --check server/web/app.js
+          node --check server/web/rich-text.js
+          node --check server/web/sw.js
+      - name: Install isolated browser test tools
+        run: |
+          npm install --prefix "$RUNNER_TEMP/compendium-browser" --no-audit --no-fund --save-exact playwright@1.62.1
+          "$RUNNER_TEMP/compendium-browser/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Exercise app with disposable data
+        env:
+          PLAYWRIGHT_PACKAGE: ${{ runner.temp }}/compendium-browser/node_modules/playwright
+        run: python scripts/browser-smoke.py
+      - name: Build container
+        run: docker build -t agentic-compendium:test .

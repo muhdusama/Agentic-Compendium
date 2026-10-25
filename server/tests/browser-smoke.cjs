@@ -1,15 +1,37 @@
-// Run against a disposable local APP_DB_PATH, not the production archive.
-// PLAYWRIGHT_PACKAGE=/path/to/playwright APP01_TEST_PASSWORD=... node server/tests/browser-smoke.cjs
+// Run via python3 scripts/browser-smoke.py, never against a production archive.
+// Set PLAYWRIGHT_PACKAGE if Playwright is installed outside node_modules.
 const playwright = require(process.env.PLAYWRIGHT_PACKAGE || 'playwright');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const BASE = process.env.APP01_TEST_BASE || 'http://127.0.0.1:8798';
 const PASSWORD = process.env.APP01_TEST_PASSWORD;
 
+async function waitForNotes(page, expected) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const matched = await page.evaluate(async expected => {
+      const {changes} = await (await fetch('/app/api/sync')).json();
+      const notes = new Map(changes.filter(r => r.kind === 'note').map(r => [r.key, r.value.text]));
+      return Object.entries(expected).every(([key, text]) => notes.get(key) === text);
+    }, expected);
+    if (matched) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error('Expected notes did not reach the server: ' + JSON.stringify(expected));
+}
+
 async function main() {
+  const target = new URL(BASE);
+  if (process.env.APP01_TEST_DISPOSABLE !== '1' || target.hostname !== '127.0.0.1' || target.protocol !== 'http:') {
+    throw new Error('Use python3 scripts/browser-smoke.py with a disposable loopback server.');
+  }
   if (!PASSWORD) throw new Error('APP01_TEST_PASSWORD is required');
   const browserType = process.env.APP01_TEST_BROWSER || 'chromium';
-  const browser = await playwright[browserType].launch({headless: true});
+  const browser = await playwright[browserType].launch({headless: true,
+    ...(process.env.APP01_TEST_EXECUTABLE ? {executablePath:process.env.APP01_TEST_EXECUTABLE} : {})});
+  const evidence = process.env.APP01_TEST_EVIDENCE || await fs.mkdtemp(path.join(os.tmpdir(), 'compendium-qa-'));
+  await fs.mkdir(evidence, {recursive:true});
   const errors = [];
   try {
     const context = await browser.newContext({viewport:{width:1194,height:834}, deviceScaleFactor:2,
@@ -170,6 +192,22 @@ async function main() {
     assert.equal(preserved?.drawingData, 'cHJlc2VydmU=');
     assert.equal(preserved?.webStrokes.length, 1);
 
+    // Switching notes faster than the network debounce must not lose either draft.
+    await page.evaluate(() => {
+      const cards = document.querySelectorAll('.delivery-card');
+      const input = document.querySelector('#noteText');
+      cards[0].click(); input.value = 'First rapid note'; input.dispatchEvent(new Event('input', {bubbles:true}));
+      cards[1].click(); input.value = 'Second rapid note'; input.dispatchEvent(new Event('input', {bubbles:true}));
+    });
+    await waitForNotes(page, {'smoke-1':'First rapid note', 'smoke-2':'Second rapid note'});
+    await page.locator('.delivery-card').first().click();
+    await page.locator('#noteText').fill('Reload-safe draft');
+    await page.waitForFunction(() => document.querySelector('#noteStatus').textContent.startsWith('Saved'));
+    await page.reload();
+    await page.locator('#workspace').waitFor({state:'visible'});
+    await page.locator('.delivery-card').first().click();
+    assert.equal(await page.locator('#noteText').inputValue(), 'Reload-safe draft');
+
     // Theme and layout on desktop, iPad portrait, expanded Duo and compact iPhone.
     await page.locator('#openSettings').click();
     await page.locator('#themeMode').selectOption('dark');
@@ -187,7 +225,7 @@ async function main() {
     assert.equal(await page.locator('.deliveries').isVisible(), false);
     await page.locator('#toggleList').click();
     assert.equal(await page.locator('.deliveries').isVisible(), true);
-    await page.screenshot({path:'.git/app01-ui-desktop-dark.png'});
+    await page.screenshot({path:path.join(evidence,'desktop-dark.png')});
     for (const [width,height] of [[834,1112],[951,760],[669,880],[390,844],[360,780]]) {
       await page.setViewportSize({width,height});
       if (width <= 760) {
@@ -197,18 +235,16 @@ async function main() {
       const dims = await page.evaluate(() => ({page:document.body.scrollWidth, screen:innerWidth}));
       assert.ok(dims.page <= dims.screen + 2, `horizontal overflow at ${width}: ${JSON.stringify(dims)}`);
     }
-    await page.screenshot({path:'.git/app01-ui-iphone-dark.png'});
+    await page.screenshot({path:path.join(evidence,'iphone-dark.png')});
 
     // Offline typed note survives reconnection and server revision updates.
     await context.setOffline(true);
     await page.locator('#noteText').fill('Offline note synchronised');
-    await page.waitForTimeout(750);
+    await page.waitForFunction(() => document.querySelector('#noteStatus').textContent.includes('waiting to sync'));
+    assert.match(await page.locator('#connectivity').innerText(), /Offline.*pending/);
     await context.setOffline(false);
     await page.locator('#refresh').click();
-    await page.waitForFunction(async () => {
-      const {changes} = await (await fetch('/app/api/sync?cursor=0')).json();
-      return changes.filter(r => r.kind === 'note' && r.key === 'smoke-1').at(-1)?.value.text === 'Offline note synchronised';
-    });
+    await waitForNotes(page, {'smoke-1':'Offline note synchronised'});
     await page.reload();
     await page.locator('#workspace').waitFor({state:'visible'});
     assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
@@ -221,8 +257,59 @@ async function main() {
     await otherPage.locator('#password').fill(PASSWORD);
     await otherPage.getByRole('button',{name:'Sign in'}).click();
     await otherPage.locator('#workspace').waitFor({state:'visible'});
+    await otherPage.waitForFunction(() => document.documentElement.dataset.theme === 'dark'
+      && document.documentElement.dataset.accent === 'rose');
     assert.equal(await otherPage.locator('html').getAttribute('data-theme'), 'dark');
     assert.equal(await otherPage.locator('html').getAttribute('data-accent'), 'rose');
+
+    // Concurrent note edits retain a draft and let the owner accept the server.
+    await page.setViewportSize({width:1194,height:834});
+    await page.locator('.delivery-card').first().click();
+    await context.setOffline(true);
+    await page.locator('#noteText').fill('Conflicting local draft');
+    await page.waitForFunction(() => document.querySelector('#noteStatus').textContent.includes('waiting to sync'));
+    await otherPage.locator('.delivery-card').first().click();
+    await otherPage.locator('#noteText').fill('Synced version from other device');
+    await waitForNotes(otherPage, {'smoke-1':'Synced version from other device'});
+    await context.setOffline(false);
+    await page.locator('#refresh').click();
+    await page.locator('#reviewConflicts').waitFor({state:'visible',timeout:10000}).catch(async error => {
+      console.error('CONFLICT DIAGNOSTICS', JSON.stringify(await page.evaluate(async () => {
+        const {changes} = await (await fetch('/app/api/sync')).json();
+        const request = indexedDB.open('app01-offline-v1', 1);
+        const db = await new Promise(resolve => { request.onsuccess = () => resolve(request.result); });
+        const read = name => new Promise(resolve => {const r=db.transaction(name).objectStore(name).getAll();r.onsuccess=()=>resolve(r.result);});
+        return {status:document.querySelector('#connectivity').textContent, title:document.querySelector('#readerTitle').textContent,
+          notes:changes.filter(r=>r.kind==='note'),pending:await read('pending'), conflicts:await read('conflicts')};
+      }), null, 2));
+      throw error;
+    });
+    await page.setViewportSize({width:360,height:780});
+    assert.ok(await page.evaluate(() => document.body.scrollWidth <= innerWidth + 2), 'Conflict notice must fit on a phone');
+    await page.screenshot({path:path.join(evidence,'phone-conflict.png')});
+    await page.locator('#reviewConflicts').click();
+    assert.equal(await page.locator('#localConflict').innerText(), 'Conflicting local draft');
+    assert.equal(await page.locator('#remoteConflict').innerText(), 'Synced version from other device');
+    await page.locator('#keepRemote').click();
+    await page.locator('#conflictDialog').waitFor({state:'hidden'});
+    assert.equal(await page.locator('#noteText').inputValue(), 'Synced version from other device');
+    await page.setViewportSize({width:1194,height:834});
+
+    // Export and re-import through the actual controls without changing records.
+    await page.locator('#openSettings').click();
+    const archiveDownload = page.waitForEvent('download');
+    await page.locator('#exportArchive').click();
+    const archive = await archiveDownload;
+    const archivePath = path.join(evidence, 'fixture-archive.json');
+    await archive.saveAs(archivePath);
+    const contents = JSON.parse(await fs.readFile(archivePath, 'utf8'));
+    assert.equal(contents.format, 'agentic-compendium-pwa');
+    assert.ok(contents.records.some(r => r.kind === 'note' && r.value.drawingData === 'cHJlc2VydmU='));
+    assert.ok(!JSON.stringify(contents).includes(PASSWORD));
+    await page.locator('#importFile').setInputFiles(archivePath);
+    await page.locator('#importButton').click();
+    await page.waitForFunction(() => /0 records imported|Already imported/.test(document.querySelector('#importStatus').textContent));
+    await page.locator('#settingsDialog').getByRole('button',{name:'Close'}).click();
 
     // Owner updates both fields. All old sessions become invalid.
     await page.locator('#openSettings').click();
@@ -240,7 +327,7 @@ async function main() {
     await page.locator('#workspace').waitFor({state:'visible'});
 
     assert.deepEqual(errors, []);
-    console.log(`APP01_BROWSER_SMOKE=PASS browser=${browserType} bulk=PASS themes=PASS rich_text=PASS offline=PASS responsive=iPad,Duo,iPhone account=PASS`);
+    console.log(`APP01_BROWSER_SMOKE=PASS browser=${browserType} bulk=PASS themes=PASS rich_text=PASS rapid_notes=PASS conflicts=PASS archive=PASS offline=PASS responsive=iPad,Duo,iPhone account=PASS evidence=${evidence}`);
   } finally { await browser.close(); }
 }
 main().catch(error => {console.error(error);process.exitCode=1;});

@@ -12,7 +12,8 @@ Agentic Compendium is a single-container application with a Python standard-libr
 - **Rich reading:** Read Hermes deliveries grouped by channel and day, with formatted Markdown headings, lists, tables, links and code. Export Rich Text Format (`.rtf`) documents.
 - **Organise safely:** Search, multi-select, move, mark read/unread, send items to Bin and restore them without deleting source deliveries or notes.
 - **Personalise:** System, Light and Dark modes, five accent colours, collapsible desktop/tablet sidebars, and responsive phone navigation.
-- **Private multi-device sync:** Incremental SQLite change cursors, optimistic revisions, conflict notices, tombstones, offline IndexedDB cache and queued typed notes.
+- **Private multi-device sync:** Incremental SQLite change cursors, optimistic revisions, tombstones, offline IndexedDB cache and immediate local note saves. Visible pending status and conflict review let you keep your draft, download it or use the synced version.
+- **Portable PWA archives:** Export deliveries, notes, channels, tombstones and original native archives from Settings. Import into another instance without overwriting conflicting data. Credentials and sessions are excluded; connect Hermes separately after importing.
 - **Hermes integration:** Optional dashboard connection and selective import of completed cron runs; Hermes remains responsible for schedules and execution.
 - **Native archives:** Import a portable export from a native Agentic Compendium App installation. Original PencilKit drawing bytes are retained without activating a web drawing interface.
 - **Account management:** Username/password owner sign-in, salted PBKDF2-SHA256 verification, revocable sessions and credential changes in Settings.
@@ -54,7 +55,7 @@ Compose mounts **`./data:/data`**. No Docker-managed volume, second application 
 
 - This is a **single-owner** application. Keep it on LAN/VPN HTTPS and do not expose the backend port or SQLite directory to the public Internet.
 - The owner web session uses HttpOnly, SameSite cookies, origin checks and server-side session revocation. Existing delivery-read and delivery-publish bearer tokens are separate credentials.
-- Hermes dashboard credentials are held in the private server database, not shipped in the web application. Only allowlisted HTTPS Hermes origins are accepted.
+- Hermes dashboard credentials are held in the private server database, not shipped in the web application. Treat the database and its filesystem backups as credential-bearing secrets. Only allowlisted HTTPS Hermes origins are accepted.
 - Offline browser storage is device-local and may contain sensitive delivery content. Avoid using shared devices; signing out is not a guarantee of device-storage erasure.
 - Native PencilKit data and historical web drawings are retained on import but are not editable in the PWA.
 - Hermes currently only exposes a bounded recent-run history for some deployments. This client does not promise gap-free catch-up after long outages.
@@ -69,7 +70,18 @@ No Node.js dependency is required at runtime. The browser UI uses standard JavaS
 python3 -m unittest discover -s server/tests -q
 ```
 
-The optional browser smoke test requires a separately installed Playwright package and a disposable local test database; it must **never** target production data.
+The browser smoke test creates and removes its own temporary SQLite database and loopback server. It covers rapid note switching, reloads, offline recovery, concurrent edits, archive downloads/imports, account changes and phone/tablet/desktop layouts. It must **never** target production data.
+
+```bash
+# Install browser test tools separately; they are not runtime dependencies.
+npm install --prefix /tmp/compendium-browser --no-audit --no-fund --save-exact playwright@1.62.1
+/tmp/compendium-browser/node_modules/.bin/playwright install chromium
+PLAYWRIGHT_PACKAGE=/tmp/compendium-browser/node_modules/playwright python3 scripts/browser-smoke.py
+```
+
+GitHub Actions runs the publication audit, Python tests, JavaScript syntax checks, disposable browser suite and container build on pushes and pull requests. The browser runner supports `APP01_TEST_BROWSER`, `APP01_TEST_EXECUTABLE` (an already-installed browser) and `APP01_TEST_EVIDENCE` (an output directory outside the source tree).
+
+For a portable export, open **Settings → Export archive** while signed in and connected. Pending changes must sync and conflicts must be resolved first. The JSON contains private content, including original imported drawings; keep it secure. PWA imports and exports are limited to 256 MiB; native imports are limited to 64 MiB. Imports merge only new records. An existing record with different content rejects the whole import. This is a content transfer feature, separate from the host's backup and recovery workflow.
 
 ## Contributing and support
 

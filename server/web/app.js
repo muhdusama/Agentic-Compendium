@@ -9,6 +9,8 @@
   const selectedKeys = new Set();
   let hermes = {connected: false}, noteTimer, toastTimer;
   let flushPromise = null, flushRequested = false;
+  let syncError = '', storageError = '', localWrites = 0;
+  const localSaves = new Set();
   const recordKey = r => [r.sourceId, r.kind, r.key].join('::');
   const itemKey = item => JSON.stringify([item.sourceId, item.delivery.id]);
   const modes = new Set(['system', 'light', 'dark']);
@@ -42,6 +44,15 @@
     tx.objectStore(store).delete(key);
     tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
   });
+  // Queue the durable draft and its visible record in the same transaction.
+  const saveRecord = (id, record, draft) => new Promise((resolve, reject) => {
+    const tx = database.transaction(['records', 'pending'], 'readwrite');
+    tx.objectStore('records').put({id, record});
+    if (draft) tx.objectStore('pending').put({id, record: draft});
+    else tx.objectStore('pending').delete(id);
+    tx.oncomplete = resolve;
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error('Local save failed'));
+  });
   const all = store => new Promise((resolve, reject) => {
     const tx = database.transaction(store, 'readonly');
     const req = tx.objectStore(store).getAll();
@@ -73,6 +84,23 @@
     $('connectivity').textContent = message;
     $('connectivity').classList.toggle('offline', offline);
   };
+  function updateSyncStatus() {
+    const count = pending.size;
+    const message = storageError ? 'Local save failed' : conflicts.size ? `${conflicts.size} sync conflict(s)`
+      : !navigator.onLine ? (count ? `Offline · ${count} pending` : 'Offline archive')
+      : !authenticated ? 'Sign in to sync' : localWrites ? 'Saving on this device…'
+      : count ? `${count} change(s) waiting to sync` : syncError || (syncing || flushPromise ? 'Synchronising…' : 'Synced');
+    status(message, !!storageError || !!syncError || !!count || !authenticated || !navigator.onLine);
+    $('connectivity').title = message;
+    $('reviewConflicts').classList.toggle('hidden', !conflicts.size);
+    $('reviewConflicts').textContent = `Review ${conflicts.size} conflict(s)`;
+    const key = current && recordKey({sourceId: current.sourceId, kind: 'note', key: current.delivery.id});
+    $('noteStatus').textContent = storageError ? 'Not saved — keep this tab open'
+      : key && conflicts.has(key) ? 'Conflict — your draft is retained'
+      : localWrites ? 'Saving on this device…'
+      : key && pending.has(key) ? 'Saved on this device · waiting to sync'
+      : 'Saved';
+  }
   async function api(path, method = 'GET', body) {
     const options = {method, credentials: 'same-origin', headers: {Accept: 'application/json'}};
     if (body !== undefined) { options.headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(body); }
@@ -98,6 +126,8 @@
       $('password').value = ''; authenticated = true;
       meta.offlineUntil = Date.now() + 12 * 3600 * 1000;
       if (database) await persist('meta', {id: 'sync', value: meta});
+      const session = await api('session');
+      hermes = session.hermes || {connected: false};
       workspace(true);
       await syncAll();
     } catch (error) { $('loginMessage').textContent = error.message; }
@@ -133,14 +163,17 @@
         authenticated = false; workspace(false);
       }
     });
-    window.addEventListener('offline', () => status('Offline archive', true));
+    window.addEventListener('offline', updateSyncStatus);
+    window.addEventListener('beforeunload', event => {
+      if (localWrites || storageError) { event.preventDefault(); event.returnValue = ''; }
+    });
     document.addEventListener('visibilitychange', () => { if (!document.hidden && authenticated) syncAll(); });
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyAppearance);
   }
   async function syncAll() {
     if (syncing) { syncRequested = true; return; }
     if (!authenticated || !database) return;
-    syncing = true; status('Synchronising…');
+    syncing = true; syncError = ''; updateSyncStatus();
     try {
       await flushPending();
       let more = true, iterations = 0;
@@ -169,15 +202,15 @@
         meta.publishedCursor = data.cursor; more = data.hasMore;
         await persist('meta', {id: 'sync', value: meta});
       }
-      status(conflicts.size ? `${conflicts.size} sync conflict(s)` : 'Synced');
       applyAppearance();
       render();
     } catch (error) {
-      status(error.status === 401 ? 'Sign in again' : 'Offline archive', true);
+      syncError = error.status === 401 ? 'Sign in again' : 'Sync failed · retry Sync';
       if (error.status === 401) authenticated = false;
       render();
     } finally {
       syncing = false;
+      updateSyncStatus();
       if (syncRequested) { syncRequested = false; if (authenticated) syncAll(); }
     }
   }
@@ -189,8 +222,12 @@
     const draft = {sourceId, kind, key, baseVersion, value, deleted};
     pending.set(id, draft);
     state.set(id, {...draft, version: baseVersion});
-    await persist('pending', {id, record: draft});
-    await persist('records', {id, record: {...draft, version: baseVersion}});
+    localWrites++; updateSyncStatus();
+    const save = saveRecord(id, {...draft, version: baseVersion}, draft);
+    localSaves.add(save);
+    try { await save; }
+    catch (error) { storageError = error.message; throw error; }
+    finally { localWrites--; localSaves.delete(save); updateSyncStatus(); }
     if (!deferUpdates) {
       render();
       if (authenticated && navigator.onLine) flushPending().catch(() => {});
@@ -200,6 +237,7 @@
     flushRequested = true;
     if (flushPromise) return flushPromise;
     flushPromise = (async () => {
+      await Promise.all([...localSaves]);
       while (flushRequested) {
         flushRequested = false;
         for (const [id, draft] of [...pending]) {
@@ -211,12 +249,12 @@
               // Another local edit arrived during this request. Its CAS base
               // must advance, but its newer body must not be overwritten.
               newer.baseVersion = result.record.version;
-              await persist('pending', {id, record: newer});
+              state.set(id, {...newer, version: newer.baseVersion});
+              await saveRecord(id, state.get(id), newer);
               flushRequested = true;
             } else {
               pending.delete(id); state.set(id, result.record);
-              await persist('records', {id, record: result.record});
-              await remove('pending', id);
+              await saveRecord(id, result.record, null);
             }
           } catch (error) {
             if (error.status === 409) {
@@ -230,25 +268,44 @@
         }
       }
     })();
-    try { await flushPromise; } finally { flushPromise = null; }
+    try { await flushPromise; syncError = ''; }
+    catch (error) {
+      syncError = error.status === 401 ? 'Sign in again' : 'Sync failed · retry Sync';
+      if (error.status === 401) authenticated = false;
+      throw error;
+    } finally { flushPromise = null; updateSyncStatus(); }
   }
   async function resolveConflicts() {
     if (!conflicts.size) return toast('No conflicts to review.');
-    for (const [id, current] of [...conflicts]) {
-      const local = pending.get(id);
-      if (!local) { conflicts.delete(id); await remove('conflicts', id); continue; }
-      const chooseLocal = confirm(`Conflicting ${local.kind}: ${local.key}\n\nOK: keep my version and overwrite the remote version.\nCancel: preserve both; export my draft before any discard.`);
-      if (!chooseLocal) {
-        const blob = new Blob([JSON.stringify(local, null, 2)], {type: 'application/json'});
-        downloadBlob(blob, `compendium-conflict-${Date.now()}.json`);
-        toast('Draft exported. Conflict remains pending until you choose to overwrite it.');
-        continue;
-      }
-      local.baseVersion = current ? current.version : 0;
-      pending.set(id, local); await persist('pending', {id, record: local});
-      conflicts.delete(id); await remove('conflicts', id);
-    }
-    if (authenticated) await syncAll();
+    showConflict();
+    $('conflictDialog').showModal();
+  }
+  function showConflict() {
+    const entry = [...conflicts].find(([id]) => pending.has(id));
+    if (!entry) { $('conflictDialog').close(); return; }
+    const [id, remote] = entry, local = pending.get(id);
+    $('conflictTitle').textContent = `Conflicting ${local.kind}`;
+    const preview = record => record?.deleted ? '(Deleted)' : record?.value?.text ?? JSON.stringify(record?.value || {}, null, 2);
+    $('localConflict').textContent = preview(local);
+    $('remoteConflict').textContent = preview(remote);
+    $('exportConflict').onclick = () => downloadBlob(new Blob([JSON.stringify(local, null, 2)], {type:'application/json'}), `compendium-draft-${Date.now()}.json`);
+    const resolve = async keepLocal => {
+      try {
+        if (keepLocal) {
+          const draft = {...local, baseVersion: remote?.version || 0};
+          pending.set(id, draft); state.set(id, {...draft, version: draft.baseVersion});
+          await saveRecord(id, state.get(id), draft);
+        } else if (remote) {
+          pending.delete(id); state.set(id, remote);
+          await saveRecord(id, remote, null);
+        } else return toast('Sync again before choosing a server version.');
+        conflicts.delete(id); await remove('conflicts', id);
+        showConflict(); render(); updateSyncStatus();
+        if (authenticated && navigator.onLine) await syncAll();
+      } catch (error) { toast('Could not resolve conflict: ' + error.message); }
+    };
+    $('keepLocal').onclick = () => resolve(true);
+    $('keepRemote').onclick = () => resolve(false);
   }
   const records = kind => [...state.values()].filter(r => r.kind === kind && !r.deleted);
   const ordered = (a, b) => (a.value.order || 0) - (b.value.order || 0) || a.key.localeCompare(b.key);
@@ -291,6 +348,7 @@
     if ($('workspace').classList.contains('hidden')) return;
     applyAppearance();
     renderChannels(); renderList(); renderReader();
+    updateSyncStatus();
     document.querySelectorAll('[data-panel]').forEach(button => {
       button.setAttribute('aria-current', $('workspace').dataset.view === button.dataset.panel ? 'page' : 'false');
     });
@@ -622,9 +680,9 @@
     $('toggleRead').disabled = showBin;
     $('hideDelivery').textContent = showBin ? 'Restore' : 'Move to Bin';
   }
-  async function changeNote(source, id, changes) {
+  async function changeNote(source, id, changes, deferUpdates = false) {
     const old = note(source, id);
-    await edit(source, 'note', id, {...old, ...changes, updatedAtWeb: new Date().toISOString()});
+    await edit(source, 'note', id, {...old, ...changes, updatedAtWeb: new Date().toISOString()}, false, deferUpdates);
   }
   function bindUI() {
     document.querySelectorAll('[data-panel]').forEach(button => button.onclick = () => {setPanel(button.dataset.panel); render();});
@@ -685,10 +743,16 @@
     $('noteText').oninput = () => {
       if (!current) return;
       const source = current.sourceId, id = current.delivery.id, text = $('noteText').value;
-      clearTimeout(noteTimer); noteTimer = setTimeout(() => changeNote(source, id, {text}).catch(error => toast(error.message)), 450);
+      // Persist every input now; only the network request is debounced.
+      changeNote(source, id, {text}, true).catch(error => toast('Note not saved: ' + error.message));
+      clearTimeout(noteTimer);
+      noteTimer = setTimeout(() => {
+        if (authenticated && navigator.onLine) flushPending().catch(() => {});
+      }, 450);
     };
     $('hermesForm').onsubmit = connectHermes;
     $('importButton').onclick = importNative;
+    $('exportArchive').onclick = exportArchive;
     $('logout').onclick = async () => {
       try {await api('logout', 'POST', {});} catch (_) {
         return toast('Connect to the LAN or VPN to sign out securely.');
@@ -699,6 +763,7 @@
       status('Signed out', true);
     };
     $('resolveConflicts').onclick = resolveConflicts;
+    $('reviewConflicts').onclick = resolveConflicts;
   }
   function applyLayout() {
     const compactTablet = window.innerWidth > 760 && window.innerWidth <= 1050;
@@ -825,10 +890,11 @@
   }
   async function importNative() {
     const file = $('importFile').files[0];
-    if (!file) return toast('Choose a native archive JSON file.');
-    if (file.size > 45 * 1024 * 1024) return toast('Archive is too large for this importer.');
+    if (!file) return toast('Choose a Compendium archive JSON file.');
+    if (file.size > 256 * 1024 * 1024) return toast('Archive exceeds the 256 MiB PWA import limit.');
     $('importStatus').textContent = 'Checking and importing archive…';
     try {
+      await prepareArchive();
       const response = await fetch('/app/api/import', {
         method: 'POST', credentials: 'same-origin',
         headers: {Accept: 'application/json', 'Content-Type': 'application/json'},
@@ -839,6 +905,24 @@
       $('importStatus').textContent = result.alreadyImported ? 'Already imported, no data changed.' : `${result.imported} records imported without overwriting existing data.`;
       await syncAll(); showSettings();
     } catch (error) { $('importStatus').textContent = error.message; }
+  }
+  async function prepareArchive() {
+    if (!authenticated || !navigator.onLine) throw new Error('Sign in and connect before exporting or importing an archive.');
+    await Promise.all([...localSaves]);
+    if (storageError) throw new Error('Resolve the local save error first.');
+    await flushPending();
+    if (pending.size || conflicts.size) throw new Error('Resolve pending sync conflicts before exporting or importing an archive.');
+  }
+  async function exportArchive() {
+    $('exportArchive').disabled = true;
+    $('importStatus').textContent = 'Synchronising changes and preparing archive…';
+    try {
+      await prepareArchive();
+      const archive = await api('export');
+      downloadBlob(new Blob([JSON.stringify(archive)], {type:'application/json'}), `compendium-archive-${new Date().toISOString().slice(0, 10)}.json`);
+      $('importStatus').textContent = 'Archive downloaded. Keep it private: it contains your deliveries and notes.';
+    } catch (error) { $('importStatus').textContent = error.message; }
+    finally { $('exportArchive').disabled = false; }
   }
   function downloadBlob(blob, name) {
     const url = URL.createObjectURL(blob);

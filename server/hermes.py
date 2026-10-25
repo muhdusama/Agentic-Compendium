@@ -107,7 +107,8 @@ class HermesAdapter:
                 return message
         return None
 
-    def pull(self, store, source, enabled):
+    def pull(self, store, source, enabled, probe_positions=None):
+        probe_positions = probe_positions if probe_positions is not None else {}
         imported, deferred, saturated = 0, 0, 0
         for job in self.jobs():
             if not isinstance(job, dict) or job.get("id") not in enabled:
@@ -118,8 +119,24 @@ class HermesAdapter:
             runs = self.runs(job_id, job.get("profile"))
             if len(runs) >= 100:
                 saturated += 1
-            newly_processed = 0
-            for run in runs:
+            window = runs[:100]
+            progress = probe_positions.get(job_id)
+            if not isinstance(progress, dict):
+                progress = {"lastProbed": progress, "seen": []} if isinstance(progress, str) else {}
+            seen = set(progress.get("seen", []))
+            new_runs = [run for run in window if isinstance(run, dict) and run.get("id") not in seen]
+            existing_runs = [run for run in window if not isinstance(run, dict) or run.get("id") in seen]
+            position = progress.get("lastProbed")
+            if position:
+                for index, run in enumerate(existing_runs):
+                    if isinstance(run, dict) and run.get("id") == position:
+                        existing_runs = existing_runs[index + 1:] + existing_runs[:index + 1]
+                        break
+            window = new_runs + existing_runs
+            probes = 0
+            # Missing results remain retryable but consume at most 20 message
+            # fetches per poll, while the rotating window reaches later runs.
+            for run in window:
                 if not isinstance(run, dict) or run.get("ended_at") is None:
                     continue
                 run_id = run.get("id")
@@ -128,10 +145,9 @@ class HermesAdapter:
                 delivery_id = f"hermes-direct:{job_id}:{run_id}"
                 if store.find(source, "delivery", delivery_id) or store.find(source, "hidden-delivery", delivery_id):
                     continue
-                if newly_processed >= 20:
+                if run.get("source") != "cron_output" and probes >= 20:
                     deferred += 1
                     continue
-                newly_processed += 1
                 stamp = run.get("started_at")
                 if run.get("source") == "cron_output":
                     preview = run.get("preview")
@@ -139,6 +155,8 @@ class HermesAdapter:
                         continue
                     body = "Script-only cron output preview. Full output is not exposed by this Hermes API.\n\n" + preview
                 else:
+                    probes += 1
+                    progress["lastProbed"] = run_id
                     message = self.last_message(run_id, run.get("profile") or job.get("profile"))
                     if not message:
                         continue
@@ -152,5 +170,10 @@ class HermesAdapter:
                                     "baseVersion": 0, "deleted": False, "value": value})
                 if not result.get("conflict"):
                     imported += 1
+            # This is only a fair-scheduling cursor. It is deliberately
+            # in-memory: no run is marked handled until a delivery is stored.
+            progress["seen"] = [run.get("id") for run in runs[:100]
+                                if isinstance(run, dict) and isinstance(run.get("id"), str)]
+            probe_positions[job_id] = progress
         return {"imported": imported, "deferred": deferred, "jobsAtWindowLimit": saturated,
                 "enabledJobs": len(enabled)}
