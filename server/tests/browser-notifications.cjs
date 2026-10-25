@@ -32,7 +32,7 @@ async function main() {
       if (path.endsWith('/notifications/unsubscribe')) { subscribed = false; return send({unsubscribed:true}); }
       if (path.endsWith('/notifications/test')) return send({accepted:true});
       if (path.endsWith('/hermes') && request.method()==='POST') return route.fulfill({status:502,contentType:'application/json',body:'{"error":"Hermes rejected the credentials."}'});
-      if (path.endsWith('/hermes')) return send({connected:true,url:'https://hermes.example.test',username:'owner',sourceId:'x',health:{state:health,error:health==='error'?{message:'unreachable'}:null}});
+      if (path.endsWith('/hermes')) return send({connected:true,url:'https://hermes.example.test',username:'owner',sourceId:'x',health:{state:health,error:health==='error'?{code:'unavailable',message:'unreachable'}:null}});
       if (path.endsWith('/hermes/check')) { health='healthy'; return send({connected:true,url:'https://hermes.example.test',username:'owner',sourceId:'x',health:{state:'healthy'}}); }
       if (path.endsWith('/logout')) logoutEndpoint=request.postDataJSON().notificationEndpoint;
       if (path.endsWith('/hermes/pull')) { pulls++; return route.fulfill({status:502,contentType:'application/json',body:'{"error":"pull failed"}'}); }
@@ -51,7 +51,7 @@ async function main() {
     await page.locator('#testNotification').click(); await page.waitForFunction(()=>document.querySelector('#notificationMessage').textContent.includes('Test accepted'));
     await page.locator('#disableNotifications').click(); await page.waitForFunction(()=>document.querySelector('#notificationMessage').textContent.includes('disabled'));
     service='unavailable'; await page.reload(); await page.locator('#workspace').waitFor(); await page.locator('#openSettings').click(); await readyNotifications(); assert.match(await page.locator('#notificationStatus').innerText(), /unavailable/);
-    health='error'; await page.reload(); await page.locator('#workspace').waitFor(); await page.locator('#openSettings').click(); await page.waitForFunction(()=>document.querySelector('#hermesStatus').textContent.includes('needs attention')); assert.match(await page.locator('#hermesStatus').innerText(), /needs attention/); await page.locator('#checkHermes').click();
+    health='error'; await page.reload(); await page.locator('#workspace').waitFor(); await page.locator('#openSettings').click(); await page.waitForFunction(()=>document.querySelector('#hermesStatus').textContent.includes('needs attention')); assert.match(await page.locator('#hermesStatus').innerText(), /needs attention/); assert.match(await page.locator('#hermesDetail').innerText(), /Check the Hermes server URL and network connection/); await page.locator('#checkHermes').click();
     await page.locator('#settingsDialog').getByRole('button',{name:'Close settings'}).click();
     const beforeSync = syncs;
     await page.locator('#refresh').click();

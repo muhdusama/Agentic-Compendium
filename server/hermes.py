@@ -81,10 +81,12 @@ class HermesAdapter:
         except (TimeoutError, socket.timeout) as exc:
             raise HermesError("Hermes request timed out", "timeout") from exc
         except URLError as exc:
+            print(f"Hermes transport failure: {type(exc.reason).__name__} errno={getattr(exc.reason, 'errno', None)}", flush=True)
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                 raise HermesError("Hermes request timed out", "timeout") from exc
             raise HermesError("Hermes request failed", "unavailable") from exc
         except ValueError as exc:
+            print(f"Hermes request validation failure: {type(exc).__name__}", flush=True)
             raise HermesError("Hermes request failed", "unavailable") from exc
 
     def login(self):

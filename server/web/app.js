@@ -931,7 +931,17 @@
     $('hermesStatus').textContent = (labels[health.state] || labels.unchecked) + (health.checking ? ' · Checking…' : '');
     const lines = [];
     if (hermes.url) lines.push(hermes.url);
-    if (health.error?.message) lines.push(health.error.message);
+    if (health.error?.message) {
+      lines.push(health.error.message);
+      const recovery = {
+        auth: 'Check the dashboard username and password, then reconnect below.',
+        rate_limit: 'Wait a few minutes, then check the connection again.',
+        timeout: 'Check that Hermes is running and reachable from this server, then retry.',
+        unavailable: 'Check the Hermes server URL and network connection, then retry.',
+        malformed: 'Check that the Hermes dashboard API is compatible, then retry.'
+      };
+      if (recovery[health.error.code]) lines.push(recovery[health.error.code]);
+    }
     if (hermes.connected) {
       lines.push('Last successful connection: ' + formatTime(health.lastSuccessAt));
       lines.push('Last successful import check: ' + formatTime(health.lastPullSuccessAt));
