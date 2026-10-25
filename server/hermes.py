@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.cookiejar
 import json
 import re
+import socket
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
@@ -12,7 +13,10 @@ from urllib.request import HTTPRedirectHandler, HTTPCookieProcessor, Request, bu
 
 
 class HermesError(RuntimeError):
-    pass
+    """Sanitised error suitable for owner-facing health state."""
+    def __init__(self, message="Hermes request failed", category="unavailable"):
+        super().__init__(message)
+        self.category = category
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -63,12 +67,25 @@ class HermesAdapter:
                 raw = response.read(4 * 1024 * 1024 + 1)
                 if len(raw) > 4 * 1024 * 1024:
                     raise HermesError("Hermes response exceeds size limit")
-                return json.loads(raw) if expect_json else None
+                try:
+                    return json.loads(raw) if expect_json else None
+                except json.JSONDecodeError as exc:
+                    raise HermesError("Hermes response was malformed", "malformed") from exc
         except HTTPError as exc:
             # Never include response bodies, cookies, usernames or passwords.
-            raise HermesError(f"Hermes returned HTTP {exc.code}") from exc
-        except (URLError, TimeoutError, ValueError) as exc:
-            raise HermesError("Hermes request failed") from exc
+            if exc.code in (401, 403):
+                raise HermesError("Hermes authentication failed", "auth") from exc
+            if exc.code == 429:
+                raise HermesError("Hermes rate limited the request", "rate_limit") from exc
+            raise HermesError("Hermes service was unavailable", "unavailable") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise HermesError("Hermes request timed out", "timeout") from exc
+        except URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise HermesError("Hermes request timed out", "timeout") from exc
+            raise HermesError("Hermes request failed", "unavailable") from exc
+        except ValueError as exc:
+            raise HermesError("Hermes request failed", "unavailable") from exc
 
     def login(self):
         self._request("/auth/password-login", body={
@@ -78,9 +95,9 @@ class HermesAdapter:
 
     def jobs(self):
         result = self.request("/api/cron/jobs", {"profile": "all"})
-        jobs = result if isinstance(result, list) else result.get("jobs", []) if isinstance(result, dict) else []
+        jobs = result if isinstance(result, list) else result.get("jobs") if isinstance(result, dict) else None
         if not isinstance(jobs, list):
-            raise HermesError("Hermes job list was malformed")
+            raise HermesError("Hermes job list was malformed", "malformed")
         return jobs
 
     def runs(self, job_id, profile):
@@ -89,17 +106,17 @@ class HermesAdapter:
             params["profile"] = profile
         result = self.request("/api/cron/jobs/" + quote(job_id, safe="") + "/runs", params)
         if not isinstance(result, dict) or not isinstance(result.get("runs"), list):
-            raise HermesError("Hermes run list was malformed")
+            raise HermesError("Hermes run list was malformed", "malformed")
         return result["runs"]
 
     def last_message(self, session_id, profile):
         params = {"profile": profile} if profile else None
         data = self.request("/api/sessions/" + quote(session_id, safe="") + "/messages", params)
-        if not isinstance(data, dict):
-            return None
-        messages = data.get("messages", data.get("data", []))
+        if not isinstance(data, dict) or ("messages" not in data and "data" not in data):
+            raise HermesError("Hermes message response was malformed", "malformed")
+        messages = data.get("messages", data.get("data"))
         if not isinstance(messages, list):
-            return None
+            raise HermesError("Hermes message response was malformed", "malformed")
         for message in reversed(messages):
             if (isinstance(message, dict) and message.get("role") == "assistant"
                     and message.get("display_kind") != "hidden"

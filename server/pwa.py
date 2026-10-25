@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 
 from server.app import ConflictError, ValidationError, canonical_delivery_json, validate_delivery
 from server.hermes import HermesAdapter, HermesError, checked_hermes_origin
+from server.notifications import Notifications
 
 STATE_KINDS = {"channel", "section", "note", "route", "job", "placement", "hidden-delivery",
                "setting", "source", "delivery"}
@@ -108,6 +109,13 @@ class PersonalState:
                 );
                 CREATE TABLE IF NOT EXISTS app_sessions (
                   token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS app_push_subscriptions (
+                  id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, subscription_json TEXT NOT NULL, generation TEXT NOT NULL,
+                  session_hash TEXT, cursor INTEGER NOT NULL, published_cursor INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL, last_accepted_at TEXT, last_error TEXT,
+                  next_attempt_at INTEGER NOT NULL DEFAULT 0, retry_delay INTEGER NOT NULL DEFAULT 0,
+                  test_at INTEGER NOT NULL DEFAULT 0
                 );
             """)
 
@@ -239,6 +247,7 @@ class PersonalState:
             db.execute("UPDATE app_config SET value_json=? WHERE name='owner_credentials'",
                        (json_bytes(updated).decode(),))
             db.execute("DELETE FROM app_sessions")
+            db.execute("DELETE FROM app_push_subscriptions")
 
     def create_session(self):
         token = secrets.token_urlsafe(32)
@@ -257,12 +266,17 @@ class PersonalState:
             row = db.execute("SELECT expires_at FROM app_sessions WHERE token_hash=?", (digest,)).fetchone()
         return row is not None and row["expires_at"] > time.time()
 
-    def revoke_session(self, token):
+    def revoke_session(self, token, notification_endpoint=None):
         if not isinstance(token, str):
             return
         with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            digest = hashlib.sha256(token.encode()).hexdigest()
             db.execute("DELETE FROM app_sessions WHERE token_hash=?",
-                       (hashlib.sha256(token.encode()).hexdigest(),))
+                       (digest,))
+            db.execute("DELETE FROM app_push_subscriptions WHERE session_hash=?", (digest,))
+            if notification_endpoint:
+                db.execute("DELETE FROM app_push_subscriptions WHERE endpoint=?", (notification_endpoint,))
 
     def import_archive(self, contents):
         if not isinstance(contents, (bytes, bytearray)):
@@ -551,6 +565,8 @@ class OwnerWeb:
         self.failed_logins = {}
         self.hermes_probe_positions = {}
         self.poll_lock = threading.Lock()
+        self.notifications = Notifications(state)
+        self._notification_started = False
 
     @staticmethod
     def _session_token(handler):
@@ -677,7 +693,8 @@ class OwnerWeb:
                                    {"error": "invalid sign-in"})
                         return True
                     self.failed_logins.pop(ip, None)
-                self._json(handler, 200, {"authenticated": True}, self._cookie(self.state.create_session()))
+                    token = self.state.create_session()
+                self._json(handler, 200, {"authenticated": True}, self._cookie(token))
             except ValidationError as exc:
                 self._json(handler, 400, {"error": str(exc)})
             except (OSError, sqlite3.DatabaseError):
@@ -714,11 +731,21 @@ class OwnerWeb:
             if (not isinstance(payload, dict) or
                     set(payload) - {"currentPassword", "username", "newPassword"}):
                 raise ValidationError("invalid account details")
-            self.state.change_owner(payload.get("currentPassword"), payload.get("username"),
-                                    payload.get("newPassword") or None)
+            with self.auth_lock, self.notifications.send_lock:
+                if not self._session(handler):
+                    raise PermissionError("Sign in again")
+                self.state.change_owner(payload.get("currentPassword"), payload.get("username"),
+                                        payload.get("newPassword") or None)
             return self._json(handler, 200, {"changed": True}, self._cookie())
         if method == "POST" and path == "/app/api/logout":
-            self.state.revoke_session(self._session_token(handler))
+            payload = self._body(handler, 8192)
+            if not isinstance(payload, dict) or set(payload) - {"notificationEndpoint"}:
+                raise ValidationError("invalid logout details")
+            endpoint = payload.get("notificationEndpoint")
+            if endpoint is not None and (not isinstance(endpoint, str) or len(endpoint) > 4096):
+                raise ValidationError("invalid push endpoint")
+            with self.auth_lock, self.notifications.send_lock:
+                self.state.revoke_session(self._session_token(handler), endpoint)
             return self._json(handler, 200, {"authenticated": False}, self._cookie())
         if method == "GET" and path == "/app/api/sync":
             try:
@@ -740,6 +767,25 @@ class OwnerWeb:
             return self._json(handler, 200, self.state.import_archive(raw))
         if method == "GET" and path == "/app/api/hermes":
             return self._json(handler, 200, self._public_hermes())
+        if method == "GET" and path == "/app/api/notifications":
+            endpoint = query.get("device", [None])[0]
+            return self._json(handler, 200, self.notifications.status(endpoint))
+        if method == "POST" and path == "/app/api/notifications/subscribe":
+            subscription = self._body(handler, 8192)
+            with self.auth_lock:
+                if not self._session(handler):
+                    raise PermissionError("Sign in again")
+                identifier = self.notifications.subscribe(subscription, self._session_token(handler))
+            return self._json(handler, 200, {"id": identifier, "subscribed": True})
+        if method == "POST" and path == "/app/api/notifications/unsubscribe":
+            data = self._body(handler, 8192)
+            if not isinstance(data, dict) or set(data) != {"endpoint"}: raise ValidationError("invalid push request")
+            self.notifications.unsubscribe(data["endpoint"])
+            return self._json(handler, 200, {"subscribed": False})
+        if method == "POST" and path == "/app/api/notifications/test":
+            data = self._body(handler, 8192)
+            if not isinstance(data, dict) or set(data) != {"endpoint"}: raise ValidationError("invalid push request")
+            return self._json(handler, 200, {"accepted": self.notifications.test(data["endpoint"])})
         if method == "POST" and path == "/app/api/hermes":
             data = self._body(handler, 4096)
             if not isinstance(data, dict):
@@ -748,26 +794,30 @@ class OwnerWeb:
             user, password = data.get("username"), data.get("password")
             if not isinstance(user, str) or not user.strip() or len(user) > 200 or not isinstance(password, str) or not password:
                 raise ValidationError("Hermes username and password required")
-            HermesAdapter(endpoint, user, password).jobs()
             source = data.get("sourceId") or str(uuid.uuid4())
             checked_string(source, "sourceId")
-            existing = self.state.find(source, "source", "self")
-            # Explicit reuse of an imported account archive is an owner action;
-            # do not silently infer identity from matching user names or URLs.
-            self.state.set_config("hermes", {"url": endpoint, "username": user,
-                                             "password": password, "sourceId": source})
-            self.hermes_probe_positions = {key: position for key, position in self.hermes_probe_positions.items()
-                                           if key[1] != source}
-            self.state.put({"sourceId": source, "kind": "source", "key": "self",
-                            "baseVersion": existing["version"] if existing else 0,
-                            "deleted": False,
-                            "value": {"name": user + " · Hermes", "url": endpoint}})
+            if not self.poll_lock.acquire(blocking=False):
+                raise HermesError("A Hermes check is already running. Try again shortly.", "busy")
+            try:
+                # Validate a candidate before replacing the working connection.
+                HermesAdapter(endpoint, user, password).jobs()
+                config = {"url": endpoint, "username": user, "password": password, "sourceId": source}
+                existing = self.state.find(source, "source", "self")
+                self.state.set_config("hermes", config)
+                self.hermes_probe_positions.clear()
+                self.state.put({"sourceId": source, "kind": "source", "key": "self",
+                                "baseVersion": existing["version"] if existing else 0,
+                                "deleted": False, "value": {"name": user + " · Hermes", "url": endpoint}})
+                now = datetime.now(timezone.utc).isoformat()
+                self._save_hermes_health(config, state="healthy", lastCheckAt=now, lastSuccessAt=now, error=None)
+            finally:
+                self.poll_lock.release()
+            return self._json(handler, 200, self._public_hermes())
+        if method == "POST" and path == "/app/api/hermes/check":
+            self.check_hermes_jobs()
             return self._json(handler, 200, self._public_hermes())
         if method == "GET" and path == "/app/api/hermes/jobs":
-            config = self.state.config("hermes")
-            if not config:
-                return self._json(handler, 200, {"jobs": []})
-            jobs = self.hermes(config).jobs()
+            jobs = self.check_hermes_jobs()
             return self._json(handler, 200, {"jobs": [
                 {"id": j["id"], "name": j.get("name", j["id"]), "profile": j.get("profile")}
                 for j in jobs if isinstance(j, dict) and isinstance(j.get("id"), str)
@@ -779,9 +829,62 @@ class OwnerWeb:
     def _public_hermes(self):
         config = self.state.config("hermes")
         if not config:
-            return {"connected": False}
+            return {"connected": False, "health": self._hermes_health(None)}
         return {"connected": True, "url": config["url"], "username": config["username"],
-                "sourceId": config["sourceId"]}
+                "sourceId": config["sourceId"], "health": self._hermes_health(config)}
+
+    @staticmethod
+    def _hermes_fingerprint(config):
+        return hashlib.sha256(json_bytes(config)).hexdigest()
+
+    def _hermes_health(self, config):
+        saved = self.state.config("hermes_health") or {}
+        if not config or saved.get("fingerprint") != self._hermes_fingerprint(config):
+            saved = {}
+        status = saved.get("state", "unchecked" if config else "not_configured")
+        if status == "healthy":
+            last = max(filter(None, [saved.get("lastPullAt"), saved.get("lastCheckAt")]), default=None)
+            if last:
+                try:
+                    age = datetime.now(timezone.utc) - datetime.fromisoformat(last.replace("Z", "+00:00"))
+                    if age.total_seconds() > getattr(self, "poll_seconds", 300) * 3:
+                        status = "stale"
+                except (TypeError, ValueError):
+                    status = "stale"
+        return {"state": status, "checking": self.poll_lock.locked(),
+                **{key: saved.get(key) for key in ("lastCheckAt", "lastSuccessAt", "lastPullAt", "lastPullSuccessAt", "lastResult", "error")},
+                "pollSeconds": getattr(self, "poll_seconds", 300)}
+
+    def _save_hermes_health(self, config, **values):
+        # Keep the fingerprint check and write together with other config mutations.
+        with self.state.lock:
+            if self.state.config("hermes") != config:
+                return
+            prior = self.state.config("hermes_health") or {}
+            fingerprint = self._hermes_fingerprint(config)
+            if prior.get("fingerprint") != fingerprint:
+                prior = {"fingerprint": fingerprint}
+            self.state.set_config("hermes_health", {**prior, **values})
+
+    def check_hermes_jobs(self):
+        if not self.poll_lock.acquire(blocking=False):
+            raise HermesError("A Hermes check is already running. Try again shortly.", "busy")
+        config = None
+        try:
+            config = self.state.config("hermes")
+            if not config:
+                return []
+            jobs = self.hermes(config).jobs()
+            now = datetime.now(timezone.utc).isoformat()
+            self._save_hermes_health(config, state="healthy", lastCheckAt=now, lastSuccessAt=now, error=None)
+            return jobs
+        except HermesError as exc:
+            if config:
+                self._save_hermes_health(config, state="error", lastCheckAt=datetime.now(timezone.utc).isoformat(),
+                                         error={"code": exc.category, "message": str(exc)})
+            raise
+        finally:
+            self.poll_lock.release()
 
     @staticmethod
     def hermes(config):
@@ -790,6 +893,7 @@ class OwnerWeb:
     def pull_hermes(self):
         if not self.poll_lock.acquire(blocking=False):
             return {"imported": 0, "busy": True}
+        config = None
         try:
             config = self.state.config("hermes")
             if not config:
@@ -797,7 +901,9 @@ class OwnerWeb:
             enabled = {entry["key"] for entry in self.state.all_kind("job", config["sourceId"])
                        if entry["value"].get("enabled")}
             if not enabled:
-                return {"imported": 0, "enabledJobs": 0}
+                result = {"imported": 0, "enabledJobs": 0}
+                self._save_hermes_health(config, state="idle", lastPullAt=datetime.now(timezone.utc).isoformat(), lastResult=result)
+                return result
             client = self.hermes(config)
             connection = (config["url"], config["sourceId"])
             positions = {job_id: self.hermes_probe_positions[(connection[0], connection[1], job_id)]
@@ -805,16 +911,43 @@ class OwnerWeb:
             result = client.pull(self.state, config["sourceId"], enabled, positions)
             for job_id, run_id in positions.items():
                 self.hermes_probe_positions[(connection[0], connection[1], job_id)] = run_id
+            now = datetime.now(timezone.utc).isoformat()
+            self._save_hermes_health(config, state="healthy", lastCheckAt=now, lastSuccessAt=now, lastPullAt=now, lastPullSuccessAt=now, lastResult=result, error=None)
             return result
+        except HermesError as exc:
+            if config:
+                now = datetime.now(timezone.utc).isoformat()
+                self._save_hermes_health(config, state="error", lastCheckAt=now, lastPullAt=now,
+                                         error={"code": exc.category, "message": str(exc)})
+            raise
         finally:
             self.poll_lock.release()
 
     def start_poller(self, interval=300):
+        self.poll_seconds = interval
         def loop():
             while True:
                 time.sleep(interval)
                 try:
                     self.pull_hermes()
-                except (HermesError, ValidationError, OSError, sqlite3.Error) as exc:
+                except Exception as exc:
                     print(f"Compendium Hermes poll failed: {type(exc).__name__}", flush=True)
+                    if not isinstance(exc, HermesError):
+                        try:
+                            config = self.state.config("hermes")
+                            if config:
+                                self._save_hermes_health(config, state="error", error={"code": "unavailable",
+                                    "message": "The import check failed. Retry Sync; if this continues, check the server logs."})
+                        except Exception:
+                            pass
         threading.Thread(target=loop, daemon=True, name="app01-hermes-poll").start()
+        if not self._notification_started:
+            self._notification_started = True
+            def notification_loop():
+                while True:
+                    time.sleep(30)
+                    try:
+                        self.notifications.poll()
+                    except Exception as exc:
+                        print(f"Compendium notification poll failed: {type(exc).__name__}", flush=True)
+            threading.Thread(target=notification_loop, daemon=True, name="app01-webpush-poll").start()

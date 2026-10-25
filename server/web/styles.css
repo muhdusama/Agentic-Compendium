@@ -141,6 +141,10 @@ button.primary{background:var(--accent-ink);border-color:var(--accent-ink);color
 /* Appearance controls. Colour options remain legible in light and dark modes. */
 .conflict-preview{white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto;background:var(--input-soft);padding:12px;border-radius:8px}
 .conflict-actions{display:flex;flex-wrap:wrap;gap:8px}
+.settings-actions{display:flex;flex-wrap:wrap;gap:8px}
+.connection-health{border:1px solid var(--line);border-radius:10px;background:var(--input-soft);padding:12px;margin-bottom:18px;overflow-wrap:anywhere}
+.connection-health p:first-child{margin-top:0;font-weight:700}
+#notificationDetail,#hermesDetail{white-space:pre-line;overflow-wrap:anywhere}
 .sync-alert{flex-shrink:0;margin:8px 12px;border-color:var(--accent);color:var(--accent-ink)}
 .notes-heading{flex-wrap:wrap;gap:8px}
 

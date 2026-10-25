@@ -8,6 +8,7 @@
   let showBin = false, selecting = false, accountUsername = 'owner';
   const selectedKeys = new Set();
   let hermes = {connected: false}, noteTimer, toastTimer;
+  let notificationBusy = false, notificationSubscription = null, notificationServer = null;
   let flushPromise = null, flushRequested = false;
   let syncError = '', storageError = '', localWrites = 0;
   const localSaves = new Set();
@@ -152,7 +153,12 @@
         $('loginMessage').textContent = error.status === 401 ? '' : 'Server unavailable. Connect to your LAN or VPN.';
       }
     }
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/app/sw.js', {scope: '/app/'}).catch(() => {});
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/app/sw.js', {scope: '/app/'}).catch(() => {});
+      navigator.serviceWorker.addEventListener('message', event => {
+        if (event.data?.type === 'compendium-deliveries' && authenticated) syncAll();
+      });
+    }
     window.addEventListener('online', async () => {
       try {
         const session = await api('session');
@@ -167,7 +173,15 @@
     window.addEventListener('beforeunload', event => {
       if (localWrites || storageError) { event.preventDefault(); event.returnValue = ''; }
     });
-    document.addEventListener('visibilitychange', () => { if (!document.hidden && authenticated) syncAll(); });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && authenticated) {
+        syncAll();
+        if ($('settingsDialog').open) { refreshHermesHealth(); refreshNotifications(); }
+      }
+    });
+    setInterval(() => {
+      if (!document.hidden && authenticated && $('settingsDialog').open) refreshHermesHealth();
+    }, 30000);
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyAppearance);
   }
   async function syncAll() {
@@ -715,12 +729,16 @@
     $('newChannel').onclick = () => createChannel();
     $('newSection').onclick = createSection;
     $('openSettings').onclick = () => {showSettings(); $('settingsDialog').showModal();};
+    $('enableNotifications').onclick = enableNotifications;
+    $('disableNotifications').onclick = disableNotifications;
+    $('testNotification').onclick = testNotification;
+    $('checkHermes').onclick = checkHermes;
     $('refresh').onclick = async () => {
       if (!authenticated) return toast('Sign in to sync.');
       try {
         if (hermes.connected) {const info = await api('hermes/pull', 'POST', {}); if (info.jobsAtWindowLimit) toast('Hermes has a limited recent-history window. Some runs may not be recoverable.');}
-        await syncAll();
-      } catch (error) {toast(error.message);}
+      } catch (error) {toast('Hermes: ' + error.message);}
+      finally { await syncAll(); await refreshHermesHealth(); }
     };
     $('readerChannel').onchange = async () => {
       if (!current) return;
@@ -754,7 +772,11 @@
     $('importButton').onclick = importNative;
     $('exportArchive').onclick = exportArchive;
     $('logout').onclick = async () => {
-      try {await api('logout', 'POST', {});} catch (_) {
+      try {
+        const subscription = await currentSubscription().catch(() => null);
+        await api('logout', 'POST', subscription ? {notificationEndpoint: subscription.endpoint} : {});
+        if (subscription) await subscription.unsubscribe().catch(() => {});
+      } catch (_) {
         return toast('Connect to the LAN or VPN to sign out securely.');
       }
       meta.offlineUntil = 0;
@@ -812,6 +834,8 @@
     saveButton.disabled = true;
     try {
       await api('account', 'POST', {currentPassword, username, newPassword});
+      const subscription = await currentSubscription().catch(() => null);
+      if (subscription) await subscription.unsubscribe().catch(() => {});
       accountUsername = username;
       $('username').value = username;
       $('accountForm').reset();
@@ -834,7 +858,9 @@
     $('hermesUrl').value = details.url || '';
     $('hermesUser').value = details.username || '';
     $('hermesPass').value = '';
-    $('hermesStatus').textContent = details.connected ? 'Connected to ' + details.url : 'Not connected';
+    $('hermesMessage').textContent = '';
+    $('notificationMessage').textContent = '';
+    renderHermesHealth(); refreshHermesHealth(); refreshNotifications();
     const selector = $('hermesSource'); selector.replaceChildren(new Option('New source', ''));
     const ids = new Set(records('delivery').map(r => r.sourceId).concat(records('note').map(r => r.sourceId)));
     if (details.sourceId) ids.add(details.sourceId);
@@ -844,14 +870,17 @@
   }
   async function connectHermes(event) {
     event.preventDefault();
-    $('hermesStatus').textContent = 'Connecting…';
+    const button = $('hermesForm').querySelector('button[type="submit"]');
+    button.disabled = true;
+    $('hermesMessage').textContent = 'Checking connection before saving…';
     try {
       hermes = await api('hermes', 'POST', {url: $('hermesUrl').value, username: $('hermesUser').value,
         password: $('hermesPass').value, sourceId: $('hermesSource').value});
       $('hermesPass').value = '';
-      $('hermesStatus').textContent = 'Connected to ' + hermes.url + '. Select the jobs you want to import.';
       await syncAll(); showSettings();
-    } catch (error) { $('hermesStatus').textContent = error.message; }
+      $('hermesMessage').textContent = 'Connection saved. Select the jobs you want to import.';
+    } catch (error) { $('hermesMessage').textContent = error.message + ' Connection settings were not changed.'; }
+    finally { button.disabled = false; }
   }
   function renderJobs() {
     const root = $('hermesJobs'); root.replaceChildren();
@@ -885,8 +914,153 @@
           line.append(label, select); root.append(line);
         }
       } catch (error) {toast(error.message); load.disabled = false;}
+      finally { await refreshHermesHealth(); }
     };
     root.append(load);
+  }
+  function formatTime(value) {
+    if (!value) return 'Not yet';
+    const date = new Date(typeof value === 'number' ? value * 1000 : value);
+    return Number.isNaN(date.getTime()) ? 'Unknown' : date.toLocaleString();
+  }
+  function renderHermesHealth() {
+    const health = hermes.health || {state: hermes.connected ? 'unchecked' : 'not_configured'};
+    const labels = {not_configured: 'Hermes is not configured', unchecked: 'Connection saved · not checked yet',
+      healthy: 'Hermes is reachable', idle: 'Import paused · no jobs enabled',
+      stale: 'Hermes status is out of date · check connection', error: 'Hermes needs attention'};
+    $('hermesStatus').textContent = (labels[health.state] || labels.unchecked) + (health.checking ? ' · Checking…' : '');
+    const lines = [];
+    if (hermes.url) lines.push(hermes.url);
+    if (health.error?.message) lines.push(health.error.message);
+    if (hermes.connected) {
+      lines.push('Last successful connection: ' + formatTime(health.lastSuccessAt));
+      lines.push('Last successful import check: ' + formatTime(health.lastPullSuccessAt));
+      const result = health.lastResult;
+      if (result) {
+        lines.push(`Last import: ${result.imported || 0} new deliveries · ${result.enabledJobs || 0} enabled jobs`);
+        if (result.deferred) lines.push(`${result.deferred} runs deferred to a later check.`);
+        if (result.jobsAtWindowLimit) lines.push('Hermes recent-history limit reached. Older runs may be missing.');
+      }
+      lines.push(`Automatic import check every ${Math.round((health.pollSeconds || 300) / 60)} minutes while the server is running.`);
+    }
+    $('hermesDetail').textContent = lines.join('\n');
+    $('checkHermes').disabled = !authenticated || !hermes.connected || health.checking;
+  }
+  async function refreshHermesHealth() {
+    if (!authenticated) return;
+    try { hermes = await api('hermes'); renderHermesHealth(); }
+    catch (_) {
+      $('hermesStatus').textContent = 'Connection status unavailable · reconnect to your LAN or VPN and retry';
+      $('checkHermes').disabled = !hermes.connected;
+    }
+  }
+  async function checkHermes() {
+    $('checkHermes').disabled = true;
+    $('hermesMessage').textContent = 'Checking Hermes…';
+    try {
+      hermes = await api('hermes/check', 'POST', {});
+      $('hermesMessage').textContent = 'Connection check completed.';
+    } catch (error) { $('hermesMessage').textContent = error.message; }
+    finally { await refreshHermesHealth(); }
+  }
+  function supportsNotifications() {
+    return window.isSecureContext && 'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator;
+  }
+  async function pushRegistration() {
+    let timer;
+    try {
+      return await Promise.race([navigator.serviceWorker.ready,
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('The app is still updating. Reload and try again.')), 8000); })]);
+    } finally { clearTimeout(timer); }
+  }
+  async function currentSubscription() {
+    if (!supportsNotifications()) return null;
+    return (await pushRegistration()).pushManager.getSubscription();
+  }
+  async function deviceId(endpoint) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(endpoint));
+    return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  function pushKey(value) {
+    return Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), char => char.charCodeAt(0));
+  }
+  function renderNotifications() {
+    const supported = supportsNotifications(), permission = supported ? Notification.permission : 'default';
+    const enabled = permission === 'granted' && notificationSubscription && notificationServer?.subscribed;
+    $('enableNotifications').disabled = notificationBusy || !authenticated || !supported || permission === 'denied' || !notificationServer?.available || !!enabled;
+    $('disableNotifications').disabled = notificationBusy || !authenticated || !notificationSubscription;
+    $('testNotification').disabled = notificationBusy || !authenticated || !enabled;
+    $('notificationStatus').textContent = !supported ? 'Notifications are unavailable in this browser. Try an installed Home Screen app or a supported HTTPS browser.'
+      : permission === 'denied' ? 'Notifications are blocked. Allow notifications in this browser’s site settings, then reopen Settings.'
+      : !notificationServer ? 'Notification service unavailable. Connect to your LAN or VPN and reopen Settings.'
+      : !notificationServer.available ? 'Notifications are unavailable on this server.'
+      : enabled ? 'Notifications enabled on this device'
+      : 'Notifications are off on this device';
+    const details = [];
+    if (notificationServer?.lastAcceptedAt) details.push('Last alert accepted by notification service: ' + formatTime(notificationServer.lastAcceptedAt));
+    if (notificationServer?.lastError) details.push('The notification service could not accept an alert. Check your connection or disable and enable this device again.');
+    if (notificationServer?.nextAttemptAt) details.push('Next retry after: ' + formatTime(notificationServer.nextAttemptAt));
+    $('notificationDetail').textContent = details.join('\n');
+  }
+  async function refreshNotifications() {
+    if (notificationBusy) return;
+    notificationServer = null;
+    if (!authenticated || !supportsNotifications()) { renderNotifications(); return; }
+    try {
+      notificationSubscription = await currentSubscription();
+      const suffix = notificationSubscription ? '?device=' + await deviceId(notificationSubscription.endpoint) : '';
+      notificationServer = await api('notifications' + suffix);
+    } catch (_) { /* Render an actionable unavailable state without exposing endpoint details. */ }
+    renderNotifications();
+  }
+  async function enableNotifications() {
+    if (notificationBusy || !supportsNotifications()) return;
+    notificationBusy = true; renderNotifications();
+    $('notificationMessage').textContent = 'Enabling notifications…';
+    try {
+      // Request permission directly from the click, before awaiting network work (required on iOS).
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') throw new Error('Notification permission was not granted. You can enable it later in browser settings.');
+      const config = await api('notifications');
+      if (!config.available || !config.publicKey) throw new Error('Notifications are unavailable on this server.');
+      const registration = await pushRegistration(), key = pushKey(config.publicKey);
+      let subscription = await registration.pushManager.getSubscription();
+      if (subscription) {
+        const existing = new Uint8Array(subscription.options.applicationServerKey || []);
+        if (existing.length !== key.length || existing.some((byte, index) => byte !== key[index])) {
+          await api('notifications/unsubscribe', 'POST', {endpoint: subscription.endpoint});
+          await subscription.unsubscribe(); subscription = null;
+        }
+      }
+      subscription = subscription || await registration.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: key});
+      notificationSubscription = subscription;
+      await api('notifications/subscribe', 'POST', subscription.toJSON());
+      $('notificationMessage').textContent = 'Enabled. Send a test alert to check this device.';
+    } catch (error) {
+      $('notificationMessage').textContent = error.status || error.name === 'Error' ? error.message : 'The browser could not enable notifications. Check site permissions and device settings, then try again.';
+    } finally { notificationBusy = false; await refreshNotifications(); }
+  }
+  async function disableNotifications() {
+    if (notificationBusy || !notificationSubscription) return;
+    notificationBusy = true; renderNotifications();
+    try {
+      await api('notifications/unsubscribe', 'POST', {endpoint: notificationSubscription.endpoint});
+      await notificationSubscription.unsubscribe(); notificationSubscription = null;
+      $('notificationMessage').textContent = 'Notifications disabled on this device.';
+    } catch (_) { $('notificationMessage').textContent = 'Could not finish disabling notifications. Connect to your LAN or VPN and try again.'; }
+    finally { notificationBusy = false; await refreshNotifications(); }
+  }
+  async function testNotification() {
+    if (notificationBusy || !notificationSubscription) return;
+    notificationBusy = true; renderNotifications();
+    $('notificationMessage').textContent = 'Sending test alert…';
+    try {
+      const result = await api('notifications/test', 'POST', {endpoint: notificationSubscription.endpoint});
+      $('notificationMessage').textContent = result.accepted
+        ? 'Test accepted by notification service. Delivery depends on browser and device settings.'
+        : 'The notification service did not accept the test. Check device status below and try again.';
+    } catch (error) { $('notificationMessage').textContent = error.message; }
+    finally { notificationBusy = false; await refreshNotifications(); }
   }
   async function importNative() {
     const file = $('importFile').files[0];

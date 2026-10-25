@@ -41,8 +41,12 @@ def main():
                         time.sleep(.1)
                 else:
                     raise RuntimeError("Disposable test server did not become ready")
-                return subprocess.run(["node", "server/tests/browser-smoke.cjs"],
-                                      cwd=root, env=env, timeout=180).returncode
+                # The full smoke changes the owner password, so run it last.
+                for suite in ("server/tests/service-worker.cjs", "server/tests/browser-notifications.cjs", "server/tests/browser-smoke.cjs"):
+                    result = subprocess.run(["node", suite], cwd=root, env=env, timeout=240)
+                    if result.returncode:
+                        return result.returncode
+                return 0
             finally:
                 server.terminate()
                 try:

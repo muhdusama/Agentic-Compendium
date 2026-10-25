@@ -10,9 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 TOP = {
     ".dockerignore", ".env.example", ".gitignore", ".github/FUNDING.yml", ".github/workflows/ci.yml",
     "Dockerfile", "compose.yaml", "LICENSE", "README.md", "scripts/check-publication.py", "scripts/browser-smoke.py",
-    "server/__init__.py", "server/app.py", "server/hermes.py", "server/pwa.py",
+    "server/__init__.py", "server/app.py", "server/hermes.py", "server/pwa.py", "server/notifications.py", "requirements.txt",
     "server/tests/__init__.py", "server/tests/test_pwa.py",
-    "server/tests/test_delivery_core.py", "server/tests/browser-smoke.cjs",
+    "server/tests/test_delivery_core.py", "server/tests/browser-smoke.cjs", "server/tests/test_notifications.py",
+    "server/tests/test_hermes_health.py", "server/tests/browser-notifications.cjs", "server/tests/service-worker.cjs",
 }
 WEB_EXTENSIONS = {".js", ".css", ".html", ".webmanifest", ".svg", ".png"}
 SAFE_IMAGES = {"server/web/icon-192.png", "server/web/icon-512.png"}

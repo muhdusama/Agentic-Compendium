@@ -11,4 +11,5 @@ __pycache__/
 .DS_Store
 ._*
 node_modules/
+.venv/
 *.sqlite*

@@ -53,7 +53,7 @@
       <aside class="channels panel" aria-label="Channels">
         <div class="panel-title"><span>YOUR CHANNELS</span><div class="sidebar-heading-actions"><button id="newSection" type="button" title="Create section">+ Section</button><button id="newChannel" type="button" title="Create channel">+ Channel</button></div></div>
         <div id="channels" class="channel-list"></div>
-        <div class="sidebar-footer"><a href="https://buymeacoffee.com/muhdusama" target="_blank" rel="noopener noreferrer">Buy me a coffee</a><span>Developed and maintained by <a href="https://imuverse.com" target="_blank" rel="noopener noreferrer">IMUVERSE</a></span></div>
+        <div class="sidebar-footer"><a href="https://buymeacoffee.com/muhdusama" target="_blank" rel="noopener noreferrer">Support the project</a><span>Developed and maintained by <a href="https://imuverse.com" target="_blank" rel="noopener noreferrer">IMUVERSE</a></span></div>
       </aside>
       <section class="deliveries panel" aria-label="Deliveries">
         <div class="list-heading"><div><span class="eyebrow" id="selectionLabel">LIBRARY</span><h2 id="listTitle">All deliveries</h2></div><div class="list-heading-actions"><span id="deliveryCount" class="counter">0</span><button type="button" id="selectMode" aria-pressed="false">Select</button></div></div>
@@ -86,7 +86,13 @@
       <label>Accent colour<select id="accentColor"><option value="teal">Teal</option><option value="ocean">Ocean</option><option value="indigo">Indigo</option><option value="amber">Amber</option><option value="rose">Rose</option></select></label></div>
       <div id="colourSwatches" class="colour-swatches" aria-label="Accent colour preview"></div>
     </section>
-    <section><h3>Owner account</h3><p class="muted small">Change the Compendium username or password. All devices will need to sign in again after a change.</p>
+    <section><h3>Browser notifications</h3><p class="muted small">Get a private alert when new deliveries arrive, even with the app closed. Alerts contain no delivery titles or content. Enable separately on each device.</p>
+      <p id="notificationStatus" class="small" role="status">Checking this device…</p>
+      <div class="settings-actions"><button id="enableNotifications" type="button" disabled>Enable on this device</button><button id="testNotification" type="button" disabled>Send test alert</button><button id="disableNotifications" type="button" disabled>Disable on this device</button></div>
+      <p id="notificationDetail" class="small muted"></p><p id="notificationMessage" class="small" role="status"></p>
+      <p class="small muted">On iPhone and iPad, add this app to your Home Screen and open it there first (iOS/iPadOS 16.4 or later). Browser and device notification settings control delivery.</p>
+    </section>
+    <section><h3>Owner account</h3><p class="muted small">Change the Compendium username or password. All devices will need to sign in again after a change. Browser notifications will also be disabled on all devices.</p>
       <form id="accountForm" class="stacked"><label>Username<input id="accountUsername" type="text" minlength="3" maxlength="32" pattern="[A-Za-z][A-Za-z0-9._-]{2,31}" autocomplete="username" required></label>
         <label>Current password<input id="accountCurrentPassword" type="password" autocomplete="current-password" required></label>
         <label>New password (leave blank to keep existing)<input id="accountNewPassword" type="password" minlength="14" autocomplete="new-password"></label>
@@ -94,13 +100,14 @@
         <button class="primary" type="submit">Update account</button></form><p id="accountStatus" class="small" role="status"></p>
     </section>
     <section><h3>Hermes connection</h3><p class="muted small">Hermes continues to own job schedules. Compendium only imports completed runs for the jobs you enable.</p>
+      <div class="connection-health"><p id="hermesStatus" class="small" role="status"></p><p id="hermesDetail" class="small muted"></p><button id="checkHermes" type="button">Check connection</button></div>
       <form id="hermesForm" class="stacked">
         <label>Server HTTPS URL<input id="hermesUrl" type="url" placeholder="https://hermes.example.com" required></label>
         <label>Dashboard username<input id="hermesUser" type="text" autocomplete="username" required></label>
         <label>Dashboard password<input id="hermesPass" type="password" autocomplete="new-password" required></label>
         <label>Archive identity <select id="hermesSource"><option value="">New source</option></select></label>
         <button type="submit" class="primary">Connect to Hermes</button>
-      </form><p id="hermesStatus" class="small muted"></p>
+      </form><p id="hermesMessage" class="small" role="status"></p>
       <div id="hermesJobs"></div>
     </section>
     <section><h3>Portable archive</h3><p class="muted small">Download your deliveries, notes, channels and original imported archives. Credentials are excluded. Import a PWA archive (up to 256 MiB) or native app archive (up to 64 MiB); conflicting records are never overwritten. Keep downloads private.</p>

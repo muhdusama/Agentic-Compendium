@@ -1,6 +1,8 @@
 FROM python:3.13-alpine
 
 WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 COPY server/ /app/server/
 
 RUN addgroup -g 1000 app && adduser -D -u 1000 -G app app \

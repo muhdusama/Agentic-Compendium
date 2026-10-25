@@ -14,7 +14,8 @@ Agentic Compendium is a single-container application with a Python standard-libr
 - **Personalise:** System, Light and Dark modes, five accent colours, collapsible desktop/tablet sidebars, and responsive phone navigation.
 - **Private multi-device sync:** Incremental SQLite change cursors, optimistic revisions, tombstones, offline IndexedDB cache and immediate local note saves. Visible pending status and conflict review let you keep your draft, download it or use the synced version.
 - **Portable PWA archives:** Export deliveries, notes, channels, tombstones and original native archives from Settings. Import into another instance without overwriting conflicting data. Credentials and sessions are excluded; connect Hermes separately after importing.
-- **Hermes integration:** Optional dashboard connection and selective import of completed cron runs; Hermes remains responsible for schedules and execution.
+- **Hermes integration:** Optional dashboard connection and selective import of completed cron runs; Hermes remains responsible for schedules and execution. Settings shows connection health, last successful checks, import results and actionable errors, with a manual connection check.
+- **Browser notifications:** Opt in on each device for generic, encrypted Web Push alerts when new deliveries arrive. Enable, test and disable from Settings. Titles and delivery content stay in your private archive.
 - **Native archives:** Import a portable export from a native Agentic Compendium App installation. Original PencilKit drawing bytes are retained without activating a web drawing interface.
 - **Account management:** Username/password owner sign-in, salted PBKDF2-SHA256 verification, revocable sessions and credential changes in Settings.
 
@@ -56,6 +57,7 @@ Compose mounts **`./data:/data`**. No Docker-managed volume, second application 
 - This is a **single-owner** application. Keep it on LAN/VPN HTTPS and do not expose the backend port or SQLite directory to the public Internet.
 - The owner web session uses HttpOnly, SameSite cookies, origin checks and server-side session revocation. Existing delivery-read and delivery-publish bearer tokens are separate credentials.
 - Hermes dashboard credentials are held in the private server database, not shipped in the web application. Treat the database and its filesystem backups as credential-bearing secrets. Only allowlisted HTTPS Hermes origins are accepted.
+- Web Push uses the browser's push service (Google, Mozilla or Apple). The server needs outbound HTTPS to that service; no public inbound push endpoint is needed. VAPID keys and device subscriptions stay in the private database and are excluded from portable archives. Sign-out disables the current device's subscription; changing the owner account disables all devices. The browser still needs LAN/VPN access to open your private archive.
 - Offline browser storage is device-local and may contain sensitive delivery content. Avoid using shared devices; signing out is not a guarantee of device-storage erasure.
 - Native PencilKit data and historical web drawings are retained on import but are not editable in the PWA.
 - Hermes currently only exposes a bounded recent-run history for some deployments. This client does not promise gap-free catch-up after long outages.
@@ -64,13 +66,17 @@ Compose mounts **`./data:/data`**. No Docker-managed volume, second application 
 
 The legacy delivery APIs remain supported: `GET /healthz`, authenticated `GET /v1/status`, `GET /v1/deliveries` and idempotent `POST /v1/deliveries`. The private PWA uses `/app/api/*` for owner login, revisions, channel/section state, note synchronisation, native imports and Hermes reading.
 
-No Node.js dependency is required at runtime. The browser UI uses standard JavaScript, CSS, IndexedDB and a service worker. Run the Python regression tests with:
+No Node.js dependency is required at runtime. The browser UI uses standard JavaScript, CSS, IndexedDB and a service worker. The Python server uses `pywebpush` and its pinned dependencies for standard Web Push encryption and VAPID signing. Use Python 3.13 and an isolated virtual environment to run the regressions:
 
 ```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 python3 -m unittest discover -s server/tests -q
+node server/tests/service-worker.cjs
 ```
 
-The browser smoke test creates and removes its own temporary SQLite database and loopback server. It covers rapid note switching, reloads, offline recovery, concurrent edits, archive downloads/imports, account changes and phone/tablet/desktop layouts. It must **never** target production data.
+The browser smoke tests create and remove their own temporary SQLite database and loopback server. They cover rapid note switching, reloads, offline recovery, concurrent edits, archive downloads/imports, account changes, Hermes status, notification controls and phone/tablet/desktop layouts. Notification permission/provider responses are mocked in the regression suite; these tests do not prove physical-device delivery. Tests must **never** target production data.
 
 ```bash
 # Install browser test tools separately; they are not runtime dependencies.
@@ -89,6 +95,6 @@ Issues and pull requests are welcome. Never include real credentials, private do
 
 **Developed and maintained by [IMUVERSE](https://imuverse.com).**
 
-If the project helps you, [buy me a coffee](https://buymeacoffee.com/muhdusama). The same link is available in the application's lower-left footer and through GitHub's support button.
+If the project helps you, [Support the project](https://buymeacoffee.com/muhdusama). The same link is available in the application's lower-left footer and through GitHub's support button.
 
 Licensed under the [MIT License](LICENSE).
