@@ -112,29 +112,14 @@ class NotificationTests(unittest.TestCase):
     def test_snapshot_generation_blocks_stale_send_after_unsubscribe_and_resubscribe(self):
         item = subscription(); self.push.subscribe(item, "first")
         self.state.put({"sourceId": "a", "kind": "delivery", "key": "new", "baseVersion": 0, "deleted": False, "value": {}})
-        original = self.push.send_lock
-        reached, release = threading.Event(), threading.Event()
-        poll_thread = []
-        class Gate:
-            calls = 0
-            def acquire(inner, *args, **kwargs):
-                if threading.current_thread() is poll_thread[0]:
-                    inner.calls += 1
-                if threading.current_thread() is poll_thread[0] and inner.calls == 2:
-                    # Initial snapshot is complete; pause before send-phase generation recheck.
-                    reached.set(); release.wait(1)
-                return original.acquire(*args, **kwargs)
-            def release(inner): return original.release()
-            def __enter__(inner): inner.acquire(); return inner
-            def __exit__(inner, *_): inner.release()
-        self.push.send_lock = Gate()
-        with mock.patch.object(self.push, "_send", return_value=(True, None, 201)) as send:
-            worker = threading.Thread(target=self.push.poll); poll_thread.append(worker); worker.start()
-            self.assertTrue(reached.wait(1))
+        pending = self.push._pending
+        def replace_device_after_snapshot(row):
             self.push.unsubscribe(item["endpoint"]); self.push.subscribe(item, "second")
-            release.set(); worker.join(1)
-            self.assertFalse(worker.is_alive()); send.assert_not_called()
-        self.push.send_lock = original
+            return pending(row)
+        with mock.patch.object(self.push, "_pending", side_effect=replace_device_after_snapshot), \
+                mock.patch.object(self.push, "_send", return_value=(True, None, 201)) as send:
+            self.push.poll()
+        send.assert_not_called()
 
     def test_published_rowid_detects_equal_and_backward_timestamps(self):
         item = subscription()
@@ -147,26 +132,46 @@ class NotificationTests(unittest.TestCase):
             self.push.poll()
         self.assertEqual(send.call_args.args[1], {"type": "deliveries"})
 
-    def test_reregistration_waits_for_inflight_410_and_preserves_new_generation(self):
+    def _stalled_poll(self, result):
+        """Start a poll whose provider call blocks until released."""
+        self.state.put({"sourceId": "a", "kind": "delivery", "key": "new", "baseVersion": 0, "deleted": False, "value": {}})
+        active, release = threading.Event(), threading.Event()
+        def stalled_send(_row, _payload):
+            active.set(); release.wait(5); return result
+        patcher = mock.patch.object(self.push, "_send", side_effect=stalled_send); patcher.start()
+        self.addCleanup(patcher.stop)
+        poller = threading.Thread(target=self.push.poll); poller.start()
+        self.assertTrue(active.wait(1))
+        return poller, release
+
+    def test_reregistration_during_inflight_410_does_not_wait_and_survives(self):
         original, replacement = subscription(), subscription()
         identifier = self.push.subscribe(original, "old-session")
-        self.state.put({"sourceId": "a", "kind": "delivery", "key": "new", "baseVersion": 0, "deleted": False, "value": {}})
-        active, release, registered = threading.Event(), threading.Event(), threading.Event()
-        def stalled_send(_row, _payload):
-            active.set(); self.assertTrue(release.wait(1)); return False, "rejected", 410
-        with mock.patch.object(self.push, "_send", side_effect=stalled_send):
-            poller = threading.Thread(target=self.push.poll); poller.start()
-            self.assertTrue(active.wait(1))
-            def reregister():
-                self.push.subscribe(replacement, "new-session"); registered.set()
-            updater = threading.Thread(target=reregister); updater.start()
-            self.assertFalse(registered.is_set())
-            release.set(); poller.join(1); updater.join(1)
-        self.assertFalse(poller.is_alive()); self.assertFalse(updater.is_alive()); self.assertTrue(registered.is_set())
+        poller, release = self._stalled_poll((False, "rejected", 410))
+        updater = threading.Thread(target=self.push.subscribe, args=(replacement, "new-session")); updater.start()
+        updater.join(1); self.assertFalse(updater.is_alive(), "re-registration must not wait for the provider")
+        release.set(); poller.join(1); self.assertFalse(poller.is_alive())
         with self.state.connect() as db:
-            row = db.execute("SELECT subscription_json,session_hash,generation FROM app_push_subscriptions WHERE id=?", (identifier,)).fetchone()
+            row = db.execute("SELECT subscription_json,session_hash FROM app_push_subscriptions WHERE id=?", (identifier,)).fetchone()
         self.assertIsNotNone(row); self.assertIn(replacement["keys"]["p256dh"], row["subscription_json"])
         self.assertNotEqual(row["session_hash"], __import__("hashlib").sha256(b"old-session").hexdigest())
+
+    def test_revocation_does_not_wait_for_provider_and_is_not_undone(self):
+        identifier = self.push.subscribe(subscription(), "session")
+        poller, release = self._stalled_poll((True, None, 201))
+        revoker = threading.Thread(target=self.push.revoke_session, args=("session",)); revoker.start()
+        revoker.join(1); self.assertFalse(revoker.is_alive(), "sign-out must not wait for the provider")
+        release.set(); poller.join(1); self.assertFalse(poller.is_alive())
+        self.assertFalse(self.push.status(identifier)["subscribed"])
+
+    def test_inflight_failure_does_not_touch_a_replaced_registration(self):
+        identifier = self.push.subscribe(subscription(), "old")
+        poller, release = self._stalled_poll((False, "unavailable", 503))
+        self.push.subscribe(subscription(), "new")
+        release.set(); poller.join(1)
+        with self.state.connect() as db:
+            row = db.execute("SELECT last_error,next_attempt_at,cursor FROM app_push_subscriptions WHERE id=?", (identifier,)).fetchone()
+        self.assertEqual((row["last_error"], row["next_attempt_at"], row["cursor"]), (None, 0, 0))
 
 
 class NotificationHTTPTests(unittest.TestCase):
@@ -207,3 +212,22 @@ class NotificationHTTPTests(unittest.TestCase):
         with self.web.state.connect() as db: db.execute("DROP TRIGGER reject_push_delete")
         status, _, _ = self.request("POST", "/app/api/account", {"username": "newowner", "currentPassword": self.password, "newPassword": "updated-owner-password-123"})
         self.assertEqual(status, 200); self.assertFalse(self.web.notifications.status(reply["id"])["subscribed"])
+
+    def test_logout_returns_while_a_push_send_is_stalled(self):
+        self.login(); sub = subscription()
+        _, reply, _ = self.request("POST", "/app/api/notifications/subscribe", sub)
+        self.web.state.put({"sourceId": "a", "kind": "delivery", "key": "new", "baseVersion": 0, "deleted": False, "value": {}})
+        active, release = threading.Event(), threading.Event()
+        def stalled_send(_row, _payload):
+            active.set(); release.wait(5); return True, None, 201
+        with mock.patch.object(self.web.notifications, "_send", side_effect=stalled_send):
+            poller = threading.Thread(target=self.web.notifications.poll); poller.start()
+            self.assertTrue(active.wait(1))
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=2)
+                conn.request("POST", "/app/api/logout", json.dumps({"notificationEndpoint": sub["endpoint"]}).encode(),
+                             {"Cookie": self.cookie, "Origin": self.origin, "Content-Type": "application/json"})
+                self.assertEqual(conn.getresponse().status, 200); conn.close()
+            finally:
+                release.set(); poller.join(1)
+        self.assertFalse(self.web.notifications.status(reply["id"])["subscribed"])

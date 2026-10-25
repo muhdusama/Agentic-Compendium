@@ -321,13 +321,39 @@ async function main() {
     await page.locator('#login').waitFor({state:'visible'});
     await otherPage.reload();
     await otherPage.locator('#login').waitFor({state:'visible'});
+    // A reverse proxy's HTML error page becomes a readable message, not a JSON parse error.
+    await page.route('**/app/api/login', route => route.fulfill({status:502, contentType:'text/html', body:'<html>Bad gateway</html>'}));
+    await page.locator('#username').fill('updated.owner');
+    await page.locator('#password').fill('new-owner-password-long-12345');
+    await page.getByRole('button',{name:'Sign in'}).click();
+    await page.waitForFunction(() => /HTTP 502/.test(document.querySelector('#loginMessage').textContent));
+    await page.unroute('**/app/api/login');
     await page.locator('#username').fill('updated.owner');
     await page.locator('#password').fill('new-owner-password-long-12345');
     await page.getByRole('button',{name:'Sign in'}).click();
     await page.locator('#workspace').waitFor({state:'visible'});
 
+    // Forgetting the device revokes the session and empties the offline copy.
+    const offlineCount = () => page.evaluate(() => new Promise((resolve, reject) => {
+      const req = indexedDB.open('app01-offline-v1', 1);
+      req.onsuccess = () => {
+        const db = req.result, tx = db.transaction(['records', 'published'], 'readonly');
+        let total = 0;
+        for (const name of ['records', 'published']) tx.objectStore(name).count().onsuccess = event => { total += event.target.result; };
+        tx.oncomplete = () => { db.close(); resolve(total); };
+      };
+      req.onerror = () => reject(req.error);
+    }));
+    assert.ok(await offlineCount() > 0, 'Fixture data must be cached before forgetting the device');
+    await page.locator('#openSettings').click();
+    page.once('dialog', dialog => dialog.accept());
+    await Promise.all([page.waitForEvent('load'), page.locator('#forgetDevice').click()]);
+    await page.locator('#login').waitFor({state:'visible'});
+    assert.equal(await offlineCount(), 0);
+    assert.equal(await page.evaluate(async () => (await fetch('/app/api/session')).status), 401);
+
     assert.deepEqual(errors, []);
-    console.log(`APP01_BROWSER_SMOKE=PASS browser=${browserType} bulk=PASS themes=PASS rich_text=PASS rapid_notes=PASS conflicts=PASS archive=PASS offline=PASS responsive=iPad,Duo,iPhone account=PASS evidence=${evidence}`);
+    console.log(`APP01_BROWSER_SMOKE=PASS browser=${browserType} bulk=PASS themes=PASS rich_text=PASS rapid_notes=PASS conflicts=PASS archive=PASS offline=PASS responsive=iPad,Duo,iPhone account=PASS proxy_error=PASS forget_device=PASS evidence=${evidence}`);
   } finally { await browser.close(); }
 }
 main().catch(error => {console.error(error);process.exitCode=1;});

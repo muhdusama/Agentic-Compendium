@@ -13,7 +13,7 @@ Include affected version or commit, the relevant endpoint or component, steps to
 - Use three different, randomly generated owner, read and publish credentials in a private `.env` file.
 - Use an HTTPS reverse proxy and restrict app access to your LAN or VPN.
 - Restrict filesystem access to `data/`, SQLite backups and downloaded archives. They can contain Hermes credentials and personal content.
-- Avoid shared devices: offline IndexedDB content is not erased by signing out.
+- Avoid shared devices. Plain sign-out keeps offline IndexedDB content; use **Sign out and forget this device** to delete it.
 - Apply updates and keep backups of your private database outside the Git repository.
 
 The repository is source code only. It must not contain production configuration, internal hostnames, personal deliveries or private backups.

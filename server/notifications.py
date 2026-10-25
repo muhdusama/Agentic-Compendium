@@ -67,7 +67,9 @@ def checked_subscription(value):
 class Notifications:
     def __init__(self, state, subject="mailto:owner@localhost"):
         self.state, self.subject = state, subject
-        self.lock, self.send_lock, self.vapid_lock = threading.RLock(), threading.Lock(), threading.Lock()
+        # No lock is held while a push provider is contacted, so sign-out never waits
+        # on the network. Result writes match the snapshot generation instead.
+        self.lock, self.vapid_lock = threading.RLock(), threading.Lock()
 
     @staticmethod
     def _now():
@@ -112,7 +114,7 @@ class Notifications:
 
     def subscribe(self, value, session_token):
         sub = checked_subscription(value); identifier = subscription_id(sub["endpoint"])
-        with self.send_lock, self.lock, self.state.lock, self.state.connect() as db:
+        with self.lock, self.state.lock, self.state.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT cursor,published_cursor FROM app_push_subscriptions WHERE id=?", (identifier,)).fetchone()
             if not row and db.execute("SELECT COUNT(*) FROM app_push_subscriptions").fetchone()[0] >= MAX_SUBSCRIPTIONS:
@@ -131,15 +133,15 @@ class Notifications:
     def unsubscribe(self, endpoint):
         if not isinstance(endpoint, str) or len(endpoint) > 4096:
             raise ValidationError("invalid push endpoint")
-        with self.send_lock, self.lock, self.state.lock, self.state.connect() as db:
+        with self.lock, self.state.lock, self.state.connect() as db:
             db.execute("DELETE FROM app_push_subscriptions WHERE id=?", (subscription_id(endpoint),))
 
     def revoke_session(self, token):
-        with self.send_lock, self.lock, self.state.lock, self.state.connect() as db:
+        with self.lock, self.state.lock, self.state.connect() as db:
             db.execute("DELETE FROM app_push_subscriptions WHERE session_hash=?", (hashlib.sha256((token or "").encode()).hexdigest(),))
 
     def revoke_all(self):
-        with self.send_lock, self.lock, self.state.lock, self.state.connect() as db:
+        with self.lock, self.state.lock, self.state.connect() as db:
             db.execute("DELETE FROM app_push_subscriptions")
 
     def _send(self, row, payload):
@@ -169,44 +171,55 @@ class Notifications:
         finally:
             session.close()
 
+    def _record(self, row, ok, error, status, advance=None, retry_delay=None):
+        """Store a provider result unless the device was revoked or re-registered meanwhile."""
+        match = (row["id"], row["generation"])
+        with self.lock, self.state.lock, self.state.connect() as db:
+            if ok:
+                db.execute("UPDATE app_push_subscriptions SET last_accepted_at=?,last_error=NULL,next_attempt_at=0,retry_delay=0 WHERE id=? AND generation=?",
+                           (self._now(), *match))
+                if advance:
+                    db.execute("UPDATE app_push_subscriptions SET cursor=?,published_cursor=? WHERE id=? AND generation=?",
+                               (*advance, *match))
+            elif status in (404, 410):
+                db.execute("DELETE FROM app_push_subscriptions WHERE id=? AND generation=?", match)
+            else:
+                delay = retry_delay or min(3600, max(60, row["retry_delay"] * 2 or 60))
+                db.execute("UPDATE app_push_subscriptions SET last_error=?,next_attempt_at=?,retry_delay=? WHERE id=? AND generation=?",
+                           (error, int(time.time()) + delay, delay, *match))
+
+    def _current(self, row):
+        with self.state.connect() as db:
+            current = db.execute("SELECT generation FROM app_push_subscriptions WHERE id=?", (row["id"],)).fetchone()
+        return current is not None and current["generation"] == row["generation"]
+
+    def _pending(self, row):
+        with self.state.connect() as db:
+            latest = db.execute("SELECT MAX(seq) FROM app_changes WHERE seq>? AND kind='delivery' AND deleted=0 AND version=1", (row["cursor"],)).fetchone()[0]
+            published = db.execute("SELECT MAX(rowid) FROM deliveries WHERE rowid>?", (row["published_cursor"],)).fetchone()[0]
+        return latest, published
+
     def test(self, endpoint):
         if not isinstance(endpoint, str) or len(endpoint) > 4096:
             raise ValidationError("invalid push endpoint")
         identifier = subscription_id(endpoint)
-        with self.send_lock:
-            with self.lock, self.state.connect() as db:
-                row = db.execute("SELECT * FROM app_push_subscriptions WHERE id=?", (identifier,)).fetchone()
-                if not row: raise ValidationError("push subscription not found")
-                if row["test_at"] + 30 > time.time(): raise ValidationError("push test is cooling down")
-                db.execute("UPDATE app_push_subscriptions SET test_at=? WHERE id=?", (int(time.time()), identifier))
-            ok, error, status = self._send(row, {"type": "test"})
-            with self.lock, self.state.lock, self.state.connect() as db:
-                if ok: db.execute("UPDATE app_push_subscriptions SET last_accepted_at=?,last_error=NULL,next_attempt_at=0,retry_delay=0 WHERE id=?", (self._now(), identifier))
-                elif status in (404, 410): db.execute("DELETE FROM app_push_subscriptions WHERE id=?", (identifier,))
-                else: db.execute("UPDATE app_push_subscriptions SET last_error=?,next_attempt_at=?,retry_delay=? WHERE id=?", (error, int(time.time()) + 60, 60, identifier))
-            return ok
+        with self.lock, self.state.lock, self.state.connect() as db:
+            row = db.execute("SELECT * FROM app_push_subscriptions WHERE id=?", (identifier,)).fetchone()
+            if not row: raise ValidationError("push subscription not found")
+            if row["test_at"] + 30 > time.time(): raise ValidationError("push test is cooling down")
+            db.execute("UPDATE app_push_subscriptions SET test_at=? WHERE id=?", (int(time.time()), identifier))
+        ok, error, status = self._send(row, {"type": "test"})
+        self._record(row, ok, error, status, retry_delay=60)
+        return ok
 
     def poll(self):
         now = int(time.time())
-        with self.send_lock, self.lock, self.state.connect() as db:
+        with self.state.connect() as db:
             rows = db.execute("SELECT * FROM app_push_subscriptions WHERE next_attempt_at<=?", (now,)).fetchall()
         for row in rows:
-            with self.state.connect() as db:
-                latest = db.execute("SELECT MAX(seq) FROM app_changes WHERE seq>? AND kind='delivery' AND deleted=0 AND version=1", (row["cursor"],)).fetchone()[0]
-                published = db.execute("SELECT MAX(rowid) FROM deliveries WHERE rowid>?", (row["published_cursor"],)).fetchone()[0]
-            if not latest and not published: continue
-            self.send_lock.acquire()
-            try:
-                with self.lock, self.state.connect() as db:
-                    current = db.execute("SELECT generation FROM app_push_subscriptions WHERE id=?", (row["id"],)).fetchone()
-                    if not current or current["generation"] != row["generation"]: continue
-                ok, error, status = self._send(row, {"type": "deliveries"})
-                with self.lock, self.state.lock, self.state.connect() as db:
-                    if ok:
-                        db.execute("UPDATE app_push_subscriptions SET cursor=?,published_cursor=?,last_accepted_at=?,last_error=NULL,next_attempt_at=0,retry_delay=0 WHERE id=?", (latest or row["cursor"], published or row["published_cursor"], self._now(), row["id"]))
-                    elif status in (404, 410): db.execute("DELETE FROM app_push_subscriptions WHERE id=?", (row["id"],))
-                    else:
-                        delay = min(3600, max(60, row["retry_delay"] * 2 or 60))
-                        db.execute("UPDATE app_push_subscriptions SET last_error=?,next_attempt_at=?,retry_delay=? WHERE id=?", (error, now + delay, delay, row["id"]))
-            finally:
-                self.send_lock.release()
+            latest, published = self._pending(row)
+            if not latest and not published or not self._current(row):
+                continue
+            ok, error, status = self._send(row, {"type": "deliveries"})
+            self._record(row, ok, error, status,
+                         (latest or row["cursor"], published or row["published_cursor"]))

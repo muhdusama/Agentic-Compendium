@@ -4,6 +4,9 @@ import base64
 import hashlib
 import http.client
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -295,6 +298,93 @@ class PWAServerTests(unittest.TestCase):
         with mock.patch("server.pwa.MAX_PWA_ARCHIVE_BODY", 100):
             with self.assertRaisesRegex(Exception, "import limit"):
                 self.state.export_archive()
+
+
+class OwnerAccessTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "deliveries.sqlite3"
+        self.delivery = DeliveryDatabase(self.path)
+        self.state = PersonalState(self.path)
+        self.web = OwnerWeb(self.state, OWNER, ORIGIN, trusted_proxies=["203.0.113.10", "198.18.0.0/15"])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_wrong_username_still_runs_the_password_hash(self):
+        with mock.patch.object(PersonalState, "_owner_password_matches", wraps=PersonalState._owner_password_matches) as check:
+            self.assertFalse(self.state.verify_owner("someone", OWNER))
+            self.assertFalse(self.state.verify_owner(None, OWNER))
+            self.assertTrue(self.state.verify_owner("owner", OWNER))
+        self.assertEqual(check.call_count, 3)
+
+    def test_both_database_layers_wait_equally_for_writers(self):
+        with self.delivery._connect() as delivery, self.state.connect() as state:
+            waits = {db.execute("PRAGMA busy_timeout").fetchone()[0] for db in (delivery, state)}
+        self.assertEqual(waits, {15000})
+
+    def test_reset_owner_replaces_credentials_and_signs_everything_out(self):
+        token = self.state.create_session()
+        with self.state.connect() as db:
+            db.execute("INSERT INTO app_push_subscriptions(id,endpoint,subscription_json,generation,cursor,created_at) "
+                       "VALUES('d','e','{}','g',0,'now')")
+        for bad in ("short", None):
+            with self.assertRaises(Exception):
+                self.state.reset_owner("owner", bad)
+        self.assertTrue(self.state.verify_owner("owner", OWNER))
+        self.state.reset_owner("recovered.owner", "recovered-password-123")
+        self.assertFalse(self.state.verify_owner("owner", OWNER))
+        self.assertTrue(self.state.verify_owner("recovered.owner", "recovered-password-123"))
+        self.assertFalse(self.state.has_session(token))
+        with self.state.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM app_push_subscriptions").fetchone()[0], 0)
+
+    def test_reset_owner_cli_reads_stdin_and_refuses_missing_database(self):
+        root = Path(__file__).resolve().parents[2]
+        def run(db_path, password):
+            return subprocess.run([sys.executable, "-m", "server.app", "reset-owner", "--username", "cli.owner"],
+                                  input=password + "\n", capture_output=True, text=True, cwd=root,
+                                  env={**os.environ, "APP_DB_PATH": str(db_path)}, timeout=60)
+        missing = run(Path(self.tmp.name) / "absent.sqlite3", "cli-owner-password-123")
+        self.assertEqual(missing.returncode, 1)
+        self.assertFalse((Path(self.tmp.name) / "absent.sqlite3").exists())
+        self.assertEqual(run(self.path, "short").returncode, 1)
+        result = run(self.path, "cli-owner-password-123")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("cli-owner-password-123", result.stdout + result.stderr)
+        self.assertTrue(self.state.verify_owner("cli.owner", "cli-owner-password-123"))
+
+    def test_forwarded_client_is_used_only_behind_trusted_proxies(self):
+        def ip(peer, forwarded=None):
+            handler = mock.Mock(client_address=(peer, 1234), headers={} if forwarded is None else {"X-Forwarded-For": forwarded})
+            return self.web._client_ip(handler)
+        self.assertEqual(ip("192.0.2.7", "198.51.100.1"), "192.0.2.7")
+        self.assertEqual(ip("203.0.113.10", "spoofed, 198.51.100.1"), "198.51.100.1")
+        self.assertEqual(ip("203.0.113.10", "198.51.100.1, 198.18.4.4"), "198.51.100.1")
+        self.assertEqual(ip("203.0.113.10"), "203.0.113.10")
+        self.assertEqual(ip("203.0.113.10", "not-an-ip"), "203.0.113.10")
+        self.assertEqual(OwnerWeb(self.state, OWNER, ORIGIN)._client_ip(
+            mock.Mock(client_address=("203.0.113.10", 1), headers={"X-Forwarded-For": "198.51.100.1"})), "203.0.113.10")
+        with self.assertRaisesRegex(ValueError, "APP_TRUSTED_PROXIES"):
+            OwnerWeb(self.state, OWNER, ORIGIN, trusted_proxies=["proxy.local"])
+
+    def test_hermes_password_is_encrypted_at_rest_and_migrated(self):
+        plain = {"url": "https://hermes.example.test", "username": "owner", "password": "hermes-secret", "sourceId": "s"}
+        self.state.set_config("hermes", plain)
+        self.web._save_hermes_health(plain, state="healthy", lastCheckAt=datetime.now(timezone.utc).isoformat())
+        web = OwnerWeb(self.state, OWNER, ORIGIN, secret_key="k" * 64)
+        stored = self.state.config("hermes")
+        self.assertNotIn("password", stored)
+        self.assertNotIn("hermes-secret", json.dumps(stored))
+        self.assertEqual(web._public_hermes()["health"]["state"], "healthy")
+        self.assertEqual(web.hermes(stored).password, "hermes-secret")
+        sealed = web._sealed({**plain, "password": "replacement-secret"})
+        self.assertEqual(web.hermes(sealed).password, "replacement-secret")
+        self.assertEqual(OwnerWeb(self.state, OWNER, ORIGIN, secret_key="k" * 64).state.config("hermes"), stored)
+        for other in (OwnerWeb(self.state, OWNER, ORIGIN, secret_key="x" * 64), OwnerWeb(self.state, OWNER, ORIGIN)):
+            with self.assertRaises(HermesError) as caught:
+                other.hermes(stored)
+            self.assertEqual(caught.exception.category, "auth")
 
 
 class PortableImportTests(unittest.TestCase):

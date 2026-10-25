@@ -26,6 +26,8 @@ MAX_BODY_BYTES = 1_048_576
 MAX_PAGE_SIZE = 500
 DEFAULT_PAGE_SIZE = 100
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+# Every connection to the shared database waits the same time for a writer.
+SQLITE_TIMEOUT_SECONDS = 15
 
 class ValidationError(ValueError):
     pass
@@ -117,7 +119,7 @@ class DeliveryDatabase:
         self._initialise()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5)
+        connection = sqlite3.connect(self.path, timeout=SQLITE_TIMEOUT_SECONDS)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
@@ -196,7 +198,6 @@ class DeliveryService:
         database: DeliveryDatabase,
         read_token: str,
         publish_token: str,
-        project_source: Any | None = None,
     ):
         if not read_token or not publish_token:
             raise ValueError("read and publish bearer tokens are required")
@@ -205,7 +206,6 @@ class DeliveryService:
         self.database = database
         self.read_token = read_token
         self.publish_token = publish_token
-        self.project_source = project_source
         self.web = None
 
     def authorised(self, header: str | None, token: str) -> bool:
@@ -288,11 +288,6 @@ def make_handler(service: DeliveryService) -> type[BaseHTTPRequestHandler]:
                     },
                 )
                 return
-            if parsed.path == "/v1/projects":
-                if not self.require_token(service.read_token):
-                    return
-                self.send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "project source unavailable"})
-                return
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def do_POST(self) -> None:
@@ -341,9 +336,34 @@ def make_handler(service: DeliveryService) -> type[BaseHTTPRequestHandler]:
 
 def check_secrets_replaced(environ: Any) -> None:
     """Refuse to serve with the public example credentials from .env.example."""
-    for name in ("APP_READ_TOKEN", "APP_PUBLISH_TOKEN", "APP_OWNER_PASSWORD"):
+    for name in ("APP_READ_TOKEN", "APP_PUBLISH_TOKEN", "APP_OWNER_PASSWORD", "APP_SECRET_KEY"):
         if "replace-with" in environ.get(name, "").lower():
             raise SystemExit(f"{name} still contains the .env.example placeholder; generate a random secret")
+
+
+def reset_owner(username: str) -> int:
+    """Set new owner credentials from a terminal prompt or the first line of stdin."""
+    from getpass import getpass
+    from server.pwa import PersonalState
+
+    path = os.environ.get("APP_DB_PATH", "./data/deliveries.sqlite3")
+    if not Path(path).is_file():
+        print(f"No database at {path}; check APP_DB_PATH. Nothing changed.", file=sys.stderr)
+        return 1
+    if sys.stdin.isatty():
+        password = getpass("New owner password: ")
+        if getpass("Repeat new owner password: ") != password:
+            print("Passwords do not match; nothing changed.", file=sys.stderr)
+            return 1
+    else:
+        password = sys.stdin.readline().rstrip("\r\n")
+    try:
+        PersonalState(path).reset_owner(username, password)
+    except ValidationError as exc:
+        print(f"{exc}; nothing changed.", file=sys.stderr)
+        return 1
+    print(f"Owner credentials reset for {username}. All sessions and push devices were signed out.")
+    return 0
 
 
 def database_from_environment() -> DeliveryDatabase:
@@ -352,11 +372,14 @@ def database_from_environment() -> DeliveryDatabase:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Agentic Compendium")
-    parser.add_argument("command", choices=["serve"])
+    parser.add_argument("command", choices=["serve", "reset-owner"])
     parser.add_argument("--host", default=os.environ.get("APP_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("APP_PORT", "8790")))
+    parser.add_argument("--username", default="owner", help="reset-owner: owner username to set")
     args = parser.parse_args(argv)
 
+    if args.command == "reset-owner":
+        return reset_owner(args.username)
     check_secrets_replaced(os.environ)
     database = database_from_environment()
     service = DeliveryService(database, os.environ.get("APP_READ_TOKEN", ""),
@@ -365,9 +388,12 @@ def main(argv: list[str] | None = None) -> int:
     if owner_password:
         from server.pwa import OwnerWeb, PersonalState
         origin = os.environ.get("APP_PUBLIC_ORIGIN", "")
-        allowed = [item.strip() for item in os.environ.get("APP_HERMES_ALLOWED_ORIGINS", "").split(",") if item.strip()]
+        def listed(name):
+            return [item.strip() for item in os.environ.get(name, "").split(",") if item.strip()]
         web = OwnerWeb(PersonalState(database.path), owner_password, origin,
-                       hermes_allowed=allowed)
+                       hermes_allowed=listed("APP_HERMES_ALLOWED_ORIGINS"),
+                       trusted_proxies=listed("APP_TRUSTED_PROXIES"),
+                       secret_key=os.environ.get("APP_SECRET_KEY", ""))
         web.delivery_db = database
         service.web = web
         web.start_poller(max(60, int(os.environ.get("APP_HERMES_POLL_SECONDS", "300"))))

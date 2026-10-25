@@ -24,7 +24,10 @@ from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from server.app import ConflictError, ValidationError, canonical_delivery_json, validate_delivery
+from cryptography.fernet import Fernet, InvalidToken
+
+from server.app import (SQLITE_TIMEOUT_SECONDS, ConflictError, ValidationError, canonical_delivery_json,
+                        validate_delivery)
 from server.hermes import HermesAdapter, HermesError, checked_hermes_origin
 from server.notifications import Notifications
 
@@ -120,9 +123,8 @@ class PersonalState:
             """)
 
     def connect(self):
-        db = sqlite3.connect(self.db_path, timeout=15)
+        db = sqlite3.connect(self.db_path, timeout=SQLITE_TIMEOUT_SECONDS)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA busy_timeout=15000")
         return db
 
     @staticmethod
@@ -226,16 +228,34 @@ class PersonalState:
 
     def verify_owner(self, username, password):
         record = self.config("owner_credentials")
+        # Always pay the hashing cost so response time does not reveal the username.
+        password_ok = self._owner_password_matches(record, password)
         return (isinstance(username, str) and OWNER_NAME.fullmatch(username) is not None and
-                hmac.compare_digest(username, record["username"]) and
-                self._owner_password_matches(record, password))
+                hmac.compare_digest(username, record["username"]) and password_ok)
 
-    def change_owner(self, current_password, username, new_password):
+    @staticmethod
+    def _check_owner_update(username, new_password):
         if not isinstance(username, str) or not OWNER_NAME.fullmatch(username):
             raise ValidationError("Username must be 3–32 letters, digits, dots, underscores or hyphens")
         if new_password is not None and (not isinstance(new_password, str)
                                          or not 14 <= len(new_password) <= 256):
             raise ValidationError("New password must be 14–256 characters")
+
+    def reset_owner(self, username, new_password):
+        """Host-side recovery: replace the owner credentials without the old password."""
+        self._check_owner_update(username, new_password)
+        if new_password is None:
+            raise ValidationError("New password must be 14–256 characters")
+        with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT INTO app_config(name,value_json) VALUES('owner_credentials',?) "
+                       "ON CONFLICT(name) DO UPDATE SET value_json=excluded.value_json",
+                       (json_bytes(self._owner_verifier(username, new_password)).decode(),))
+            db.execute("DELETE FROM app_sessions")
+            db.execute("DELETE FROM app_push_subscriptions")
+
+    def change_owner(self, current_password, username, new_password):
+        self._check_owner_update(username, new_password)
         with self.lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             entry = db.execute("SELECT value_json FROM app_config WHERE name='owner_credentials'").fetchone()
@@ -548,7 +568,8 @@ class PersonalState:
 
 
 class OwnerWeb:
-    def __init__(self, state, owner_password, public_origin, static_dir=None, hermes_allowed=None):
+    def __init__(self, state, owner_password, public_origin, static_dir=None, hermes_allowed=None,
+                 trusted_proxies=None, secret_key=""):
         if len(owner_password) < 20:
             raise ValueError("APP_OWNER_PASSWORD must be at least 20 characters")
         self.state = state
@@ -561,6 +582,13 @@ class OwnerWeb:
             raise ValueError("invalid APP_PUBLIC_ORIGIN")
         self.static = Path(static_dir or Path(__file__).parent / "web")
         self.allowed_hermes = set(hermes_allowed or [])
+        try:
+            self.trusted_proxies = [ipaddress.ip_network(item, strict=False) for item in trusted_proxies or []]
+        except ValueError as exc:
+            raise ValueError("invalid APP_TRUSTED_PROXIES entry") from exc
+        # Optional at-rest encryption of the Hermes password; any random secret works.
+        self.cipher = Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret_key.encode()).digest())) if secret_key else None
+        self._seal_stored_hermes_password()
         self.auth_lock = threading.Lock()
         self.failed_logins = {}
         self.hermes_probe_positions = {}
@@ -586,6 +614,28 @@ class OwnerWeb:
         value = token or ""
         secure = "; Secure" if self.origin.startswith("https://") else ""
         return f"compendium_sid={value}; HttpOnly; SameSite=Strict; Path=/app/; Max-Age={43200 if token else 0}{secure}"
+
+    def _client_ip(self, handler):
+        """Throttle by the real client behind an explicitly trusted proxy, never a spoofed header."""
+        def trusted(address):
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError:
+                return False
+            return any(ip in network for network in self.trusted_proxies)
+        client = handler.client_address[0]
+        if not trusted(client):
+            return client
+        for hop in reversed(handler.headers.get("X-Forwarded-For", "").split(",")):
+            hop = hop.strip()
+            if not trusted(hop):
+                # The first untrusted hop from the right was added by a trusted proxy.
+                try:
+                    return str(ipaddress.ip_address(hop))
+                except ValueError:
+                    return client
+            client = hop
+        return client
 
     def _login_blocked(self, ip, now):
         for address, failures in list(self.failed_logins.items()):
@@ -681,7 +731,7 @@ class OwnerWeb:
                 if not isinstance(supplied, str):
                     supplied = ""
                 with self.auth_lock:
-                    ip = handler.client_address[0]
+                    ip = self._client_ip(handler)
                     now = time.time()
                     if self._login_blocked(ip, now):
                         self._json(handler, 429, {"error": "invalid sign-in"})
@@ -731,7 +781,7 @@ class OwnerWeb:
             if (not isinstance(payload, dict) or
                     set(payload) - {"currentPassword", "username", "newPassword"}):
                 raise ValidationError("invalid account details")
-            with self.auth_lock, self.notifications.send_lock:
+            with self.auth_lock:
                 if not self._session(handler):
                     raise PermissionError("Sign in again")
                 self.state.change_owner(payload.get("currentPassword"), payload.get("username"),
@@ -744,7 +794,7 @@ class OwnerWeb:
             endpoint = payload.get("notificationEndpoint")
             if endpoint is not None and (not isinstance(endpoint, str) or len(endpoint) > 4096):
                 raise ValidationError("invalid push endpoint")
-            with self.auth_lock, self.notifications.send_lock:
+            with self.auth_lock:
                 self.state.revoke_session(self._session_token(handler), endpoint)
             return self._json(handler, 200, {"authenticated": False}, self._cookie())
         if method == "GET" and path == "/app/api/sync":
@@ -801,7 +851,7 @@ class OwnerWeb:
             try:
                 # Validate a candidate before replacing the working connection.
                 HermesAdapter(endpoint, user, password).jobs()
-                config = {"url": endpoint, "username": user, "password": password, "sourceId": source}
+                config = self._sealed({"url": endpoint, "username": user, "password": password, "sourceId": source})
                 existing = self.state.find(source, "source", "self")
                 self.state.set_config("hermes", config)
                 self.hermes_probe_positions.clear()
@@ -886,9 +936,34 @@ class OwnerWeb:
         finally:
             self.poll_lock.release()
 
-    @staticmethod
-    def hermes(config):
-        return HermesAdapter(config["url"], config["username"], config["password"])
+    def _sealed(self, config):
+        if not self.cipher or "password" not in config:
+            return config
+        sealed = {key: value for key, value in config.items() if key != "password"}
+        sealed["passwordEncrypted"] = self.cipher.encrypt(config["password"].encode()).decode()
+        return sealed
+
+    def _seal_stored_hermes_password(self):
+        """Encrypt a plaintext stored password once a key is configured, keeping its health record."""
+        with self.state.lock:
+            config = self.state.config("hermes")
+            sealed = self._sealed(config) if config else config
+            if sealed == config:
+                return
+            health = self.state.config("hermes_health")
+            self.state.set_config("hermes", sealed)
+            if health and health.get("fingerprint") == self._hermes_fingerprint(config):
+                self.state.set_config("hermes_health", {**health, "fingerprint": self._hermes_fingerprint(sealed)})
+
+    def hermes(self, config):
+        password = config.get("password")
+        if password is None:
+            try:
+                password = self.cipher.decrypt(config["passwordEncrypted"].encode()).decode()
+            except (AttributeError, KeyError, InvalidToken) as exc:
+                raise HermesError("The stored Hermes password cannot be decrypted. Check APP_SECRET_KEY "
+                                  "or reconnect Hermes in Settings.", "auth") from exc
+        return HermesAdapter(config["url"], config["username"], password)
 
     def pull_hermes(self):
         if not self.poll_lock.acquire(blocking=False):

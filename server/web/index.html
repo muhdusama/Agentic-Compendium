@@ -113,9 +113,10 @@
     <section><h3>Portable archive</h3><p class="muted small">Download your deliveries, notes, channels and original imported archives. Credentials are excluded. Import a PWA archive (up to 256 MiB) or native app archive (up to 64 MiB); conflicting records are never overwritten. Keep downloads private.</p>
       <button id="exportArchive" type="button">Export archive</button><label class="import-field">Choose archive<input type="file" id="importFile" accept=".json,application/json"></label><button id="importButton" type="button">Import archive</button><p id="importStatus" class="small muted" role="status"></p>
     </section>
-    <section><h3>Privacy & access</h3><p class="small muted">This PWA uses a private owner session, a single SQLite database and device-local offline cache. Signing out does not remove this device's offline cache. Avoid using shared devices. The native app is not replaced or deleted.</p>
+    <section><h3>Privacy & access</h3><p class="small muted">This PWA uses a private owner session, a single SQLite database and device-local offline cache. Sign out keeps this device's offline copy; use Forget this device on shared or lost devices to delete it. The native app is not replaced or deleted.</p>
       <button id="resolveConflicts" type="button">Review pending conflicts</button>
       <button id="logout" type="button">Sign out</button>
+      <button id="forgetDevice" type="button" class="subtle-danger">Sign out and forget this device</button>
     </section>
   </dialog>
   <dialog id="conflictDialog" class="dialog">

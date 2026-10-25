@@ -17,7 +17,7 @@ Agentic Compendium is a single-container application with a Python standard-libr
 - **Hermes integration:** Optional dashboard connection and selective import of completed cron runs; Hermes remains responsible for schedules and execution. Settings shows connection health, last successful checks, import results and actionable errors, with a manual connection check.
 - **Browser notifications:** Opt in on each device for generic, encrypted Web Push alerts when new deliveries arrive. Enable, test and disable from Settings. Titles and delivery content stay in your private archive.
 - **Native archives:** Import a portable export from a native Agentic Compendium App installation. Original PencilKit drawing bytes are retained without activating a web drawing interface.
-- **Account management:** Username/password owner sign-in, salted PBKDF2-SHA256 verification, revocable sessions and credential changes in Settings.
+- **Account management:** Username/password owner sign-in, salted PBKDF2-SHA256 verification, revocable sessions, credential changes in Settings and host-side password recovery.
 
 ## Quick start
 
@@ -37,6 +37,39 @@ docker compose --env-file .env up -d --build
 ```
 
 Visit **`https://your-host.example/app/`**, then sign in as **`owner`** with the `APP_OWNER_PASSWORD` from your private `.env`. You can change the username and password in Settings. The bootstrap password is stored as a salted verifier in the SQLite database on first run, and changing it does not reset it on subsequent container restarts.
+
+### Recover the owner password
+
+If you lose the owner password, reset it from the host. This signs out every session and push device:
+
+```bash
+docker compose --env-file .env exec delivery-service python -m server.app reset-owner --username owner
+```
+
+The command prompts twice for the new password (14–256 characters). To script it, pipe the password on standard input and add `-T` after `exec`. Changing `APP_OWNER_PASSWORD` in `.env` does **not** reset an existing owner.
+
+### Optional settings
+
+| Setting | Purpose |
+| --- | --- |
+| `APP_SECRET_KEY` | Encrypts the stored Hermes password at rest. Generate it like the other secrets and keep a copy: if it is lost or changed, reconnect Hermes in Settings. An existing plaintext password is encrypted on the next start. |
+| `APP_TRUSTED_PROXIES` | Comma-separated proxy IPs or CIDRs. Sign-in throttling then uses the client address from that proxy's `X-Forwarded-For` instead of the proxy's own address. With Docker port publishing the proxy usually appears as the Docker bridge gateway; use the client address shown in the container log for sign-in requests. Leave empty if you are unsure: all sign-in failures then share one limit. |
+| `APP_MEMORY_LIMIT` | Container memory limit, default `2g`. Imports near the 256 MiB limit are parsed in memory and may need more. |
+
+### Hermes behind a private certificate authority
+
+The container trusts the public CAs in its image. If your Hermes dashboard uses an internal CA, mount a PEM bundle with that CA and point Python at it in a `compose.override.yaml`:
+
+```yaml
+services:
+  delivery-service:
+    environment:
+      SSL_CERT_FILE: /certs/ca-bundle.pem
+    volumes:
+      - ./certs/ca-bundle.pem:/certs/ca-bundle.pem:ro
+```
+
+Include public CAs in the same bundle if you use Web Push, because notification services use public certificates. Never disable TLS verification.
 
 ### Optional per-app DNS
 
@@ -64,20 +97,21 @@ Compose mounts **`./data:/data`**. No Docker-managed volume, second application 
 - The owner web session uses HttpOnly, SameSite cookies, origin checks and server-side session revocation. Existing delivery-read and delivery-publish bearer tokens are separate credentials.
 - Hermes dashboard credentials are held in the private server database, not shipped in the web application. Treat the database and its filesystem backups as credential-bearing secrets. Only allowlisted HTTPS Hermes origins are accepted.
 - Web Push uses the browser's push service (Google, Mozilla or Apple). The server needs outbound HTTPS to that service; no public inbound push endpoint is needed. VAPID keys and device subscriptions stay in the private database and are excluded from portable archives. Sign-out disables the current device's subscription; changing the owner account disables all devices. The browser still needs LAN/VPN access to open your private archive.
-- Offline browser storage is device-local and may contain sensitive delivery content. Avoid using shared devices; signing out is not a guarantee of device-storage erasure.
+- Offline browser storage is device-local and may contain sensitive delivery content. **Sign out** keeps it for offline reading; **Sign out and forget this device** in Settings deletes this app's offline database, cached files and layout preferences. Browsers may still retain data outside the app's control, so avoid shared devices.
+- Signing out never waits for a slow push service. A generic alert that was already being sent at that moment may still arrive once; it contains no delivery content.
 - Native PencilKit data and historical web drawings are retained on import but are not editable in the PWA.
 - Hermes currently only exposes a bounded recent-run history for some deployments. This client does not promise gap-free catch-up after long outages.
 
 ## API and development
 
-The legacy delivery APIs remain supported: `GET /healthz`, authenticated `GET /v1/status`, `GET /v1/deliveries` and idempotent `POST /v1/deliveries`. The private PWA uses `/app/api/*` for owner login, revisions, channel/section state, note synchronisation, native imports and Hermes reading.
+The legacy delivery APIs remain supported: `GET /healthz`, authenticated `GET /v1/status`, `GET /v1/deliveries` and idempotent `POST /v1/deliveries`. Delivery cursors are opaque and follow arrival order; cursors issued by earlier versions keep working. The private PWA uses `/app/api/*` for owner login, revisions, channel/section state, note synchronisation, native imports and Hermes reading.
 
 No Node.js dependency is required at runtime. The browser UI uses standard JavaScript, CSS, IndexedDB and a service worker. The Python server uses `pywebpush` and its pinned dependencies for standard Web Push encryption and VAPID signing. Use Python 3.13 and an isolated virtual environment to run the regressions:
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.txt
 python3 -m unittest discover -s server/tests -q
 node server/tests/service-worker.cjs
 ```

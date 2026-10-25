@@ -14,6 +14,8 @@ services:
       APP_PUBLIC_ORIGIN: ${APP_PUBLIC_ORIGIN:?set your HTTPS app origin in .env}
       APP_HERMES_ALLOWED_ORIGINS: ${APP_HERMES_ALLOWED_ORIGINS:-}
       APP_HERMES_POLL_SECONDS: ${APP_HERMES_POLL_SECONDS:-300}
+      APP_TRUSTED_PROXIES: ${APP_TRUSTED_PROXIES:-}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-}
     ports:
       - "${APP_BIND_IP:-127.0.0.1}:8790:8790"
     volumes:
@@ -26,6 +28,11 @@ services:
       start_period: 5s
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Large archive imports are parsed in memory; raise this if a 256 MiB import fails.
+    mem_limit: ${APP_MEMORY_LIMIT:-2g}
+    pids_limit: 256
     read_only: true
     tmpfs:
       - /tmp

@@ -106,9 +106,12 @@
     const options = {method, credentials: 'same-origin', headers: {Accept: 'application/json'}};
     if (body !== undefined) { options.headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(body); }
     const response = await fetch('/app/api/' + path, options);
-    const result = await response.json();
-    if (!response.ok) {
-      const error = new Error(result.error || 'Request failed');
+    // A reverse proxy may answer with an HTML error page instead of the app's JSON.
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result) {
+      const error = new Error(result?.error || (response.ok ? 'The server sent an unexpected response.'
+        : response.status >= 502 ? `The server is unavailable (HTTP ${response.status}). Check your LAN or VPN connection.`
+        : `Request failed (HTTP ${response.status}).`));
       error.status = response.status; error.result = result; throw error;
     }
     return result;
@@ -771,21 +774,38 @@
     $('hermesForm').onsubmit = connectHermes;
     $('importButton').onclick = importNative;
     $('exportArchive').onclick = exportArchive;
-    $('logout').onclick = async () => {
-      try {
-        const subscription = await currentSubscription().catch(() => null);
-        await api('logout', 'POST', subscription ? {notificationEndpoint: subscription.endpoint} : {});
-        if (subscription) await subscription.unsubscribe().catch(() => {});
-      } catch (_) {
-        return toast('Connect to the LAN or VPN to sign out securely.');
-      }
-      meta.offlineUntil = 0;
-      if (database) await persist('meta', {id: 'sync', value: meta});
-      authenticated = false; $('settingsDialog').close(); workspace(false);
-      status('Signed out', true);
-    };
+    $('logout').onclick = () => signOut(false);
+    $('forgetDevice').onclick = () => signOut(true);
     $('resolveConflicts').onclick = resolveConflicts;
     $('reviewConflicts').onclick = resolveConflicts;
+  }
+  async function signOut(forget) {
+    if (forget && (pending.size || conflicts.size || localWrites) &&
+        !confirm('This device has changes that have not synced. Forgetting it deletes them. Continue?')) return;
+    try {
+      const subscription = await currentSubscription().catch(() => null);
+      await api('logout', 'POST', subscription ? {notificationEndpoint: subscription.endpoint} : {});
+      if (subscription) await subscription.unsubscribe().catch(() => {});
+    } catch (_) {
+      return toast('Connect to the LAN or VPN to sign out securely.');
+    }
+    if (forget) {
+      // Remove every copy this app keeps on the device, then start clean.
+      database?.close();
+      await new Promise(resolve => {
+        const req = indexedDB.deleteDatabase('app01-offline-v1');
+        req.onsuccess = req.onerror = req.onblocked = () => resolve();
+      });
+      if ('caches' in self) for (const key of await caches.keys()) if (key.startsWith('app01-')) await caches.delete(key);
+      try {
+        for (const key of Object.keys(localStorage)) if (key.startsWith('app01-')) localStorage.removeItem(key);
+      } catch (_) { /* Storage may be unavailable; the offline database is already gone. */ }
+      return location.replace('/app/');
+    }
+    meta.offlineUntil = 0;
+    if (database) await persist('meta', {id: 'sync', value: meta});
+    authenticated = false; $('settingsDialog').close(); workspace(false);
+    status('Signed out', true);
   }
   function applyLayout() {
     const compactTablet = window.innerWidth > 760 && window.innerWidth <= 1050;
