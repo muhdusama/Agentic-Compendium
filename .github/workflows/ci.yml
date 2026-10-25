@@ -41,3 +41,25 @@ jobs:
         run: python scripts/browser-smoke.py
       - name: Build container
         run: docker build -t agentic-compendium:test .
+      - name: Validate optional DNS deployment configuration
+        run: |
+          docker compose --env-file .env.example config --format json > "$RUNNER_TEMP/compose-default.json"
+          cp .env.example "$RUNNER_TEMP/compose-dns.env"
+          cat >> "$RUNNER_TEMP/compose-dns.env" <<'ENV'
+          APP_DNS_SERVER=203.0.113.53
+          COMPOSE_FILE=compose.yaml:compose.dns.yaml
+          ENV
+          docker compose --env-file "$RUNNER_TEMP/compose-dns.env" config --format json > "$RUNNER_TEMP/compose-dns.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          baseline = json.loads((root / 'compose-default.json').read_text())
+          override = json.loads((root / 'compose-dns.json').read_text())
+          assert override['services']['delivery-service'].pop('dns') == ['203.0.113.53']
+          assert override == baseline, 'DNS override changed unrelated deployment settings'
+          PY
+          if APP_DNS_SERVER='' docker compose --env-file .env.example -f compose.yaml -f compose.dns.yaml config --quiet 2> "$RUNNER_TEMP/missing-dns.log"; then
+            echo "DNS override incorrectly accepted a missing resolver"
+            exit 1
+          fi

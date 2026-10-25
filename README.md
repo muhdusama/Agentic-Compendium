@@ -38,6 +38,12 @@ docker compose --env-file .env up -d --build
 
 Visit **`https://your-host.example/app/`**, then sign in as **`owner`** with the `APP_OWNER_PASSWORD` from your private `.env`. You can change the username and password in Settings. The bootstrap password is stored as a salted verifier in the SQLite database on first run, and changing it does not reset it on subsequent container restarts.
 
+### Optional per-app DNS
+
+If Hermes checks fail because Docker's inherited DNS resolver cannot resolve the server, test your existing LAN DNS service from the container. To select a working resolver for this app, set `APP_DNS_SERVER` to its IP address in the private `.env`, and add `COMPOSE_FILE=compose.yaml:compose.dns.yaml`. On Windows use `;` instead of `:` between file names. Then run the same `docker compose --env-file .env up -d --build` command. Keep these settings for later deployments.
+
+The optional override changes only this service's DNS upstream. It preserves Docker's internal service-name resolution and does not change host DNS or other applications. Choose a resolver that handles both your private Hermes name and public notification-service names; do not substitute a public resolver if your private names require LAN DNS. A missing `APP_DNS_SERVER` fails validation when the override is selected. To return to inherited DNS, remove the two settings and recreate the service. See [Docker's Compose override documentation](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/).
+
 ## Persistent host storage
 
 ```text

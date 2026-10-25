@@ -1,0 +1,5 @@
+# Optional per-app DNS override. Keep deployment addresses in the private .env.
+services:
+  delivery-service:
+    dns:
+      - "${APP_DNS_SERVER:?Set APP_DNS_SERVER to a reachable DNS resolver IP}"
