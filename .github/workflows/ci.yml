@@ -39,8 +39,13 @@ jobs:
         env:
           PLAYWRIGHT_PACKAGE: ${{ runner.temp }}/compendium-browser/node_modules/playwright
         run: python scripts/browser-smoke.py
-      - name: Build container
-        run: docker build -t agentic-compendium:test .
+      - name: Build container and verify private files stay outside the image
+        run: |
+          mkdir -p server/web/not-for-release
+          printf 'disposable test data\n' > server/web/not-for-release/local.sqlite
+          printf 'disposable test data\n' > server/local.pem
+          docker build -t agentic-compendium:test .
+          docker run --rm --entrypoint sh agentic-compendium:test -c 'test ! -e /app/server/local.pem && test ! -e /app/server/web/not-for-release/local.sqlite'
       - name: Validate optional DNS deployment configuration
         run: |
           docker compose --env-file .env.example config --format json > "$RUNNER_TEMP/compose-default.json"

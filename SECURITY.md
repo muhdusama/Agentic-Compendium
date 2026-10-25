@@ -4,7 +4,7 @@ Agentic Compendium is a single-owner, self-hosted app intended for access over a
 
 ## Reporting a vulnerability
 
-Report security issues privately through GitHub's **Security** tab using **Report a vulnerability**. Please do not put vulnerabilities, exploit details, credentials or personal data in public issues, pull requests or screenshots.
+Use GitHub's **Security** tab and **Report a vulnerability** when private vulnerability reporting is available. If that option is not enabled, open an issue requesting a secure contact channel **without disclosing any vulnerability details**. Never post exploits, credentials or personal data publicly.
 
 Include affected version or commit, the relevant endpoint or component, steps to reproduce using disposable data, and the potential impact. Do not test against another person's instance.
 
