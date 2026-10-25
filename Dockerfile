@@ -3,7 +3,8 @@ FROM python:3.13-alpine
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-COPY server/ /app/server/
+COPY server/__init__.py server/app.py server/hermes.py server/notifications.py server/pwa.py /app/server/
+COPY server/web/app.js server/web/icon-192.png server/web/icon-512.png server/web/icon.svg server/web/index.html server/web/manifest.webmanifest server/web/rich-text.js server/web/styles.css server/web/sw.js /app/server/web/
 
 RUN addgroup -g 1000 app && adduser -D -u 1000 -G app app \
     && mkdir -p /data && chown -R app:app /app /data

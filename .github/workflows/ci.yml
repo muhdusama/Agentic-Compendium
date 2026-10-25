@@ -46,6 +46,11 @@ jobs:
           printf 'disposable test data\n' > server/local.pem
           docker build -t agentic-compendium:test .
           docker run --rm --entrypoint sh agentic-compendium:test -c 'test ! -e /app/server/local.pem && test ! -e /app/server/web/not-for-release/local.sqlite'
+          docker build -t agentic-compendium:context-audit -f - . <<'DOCKERFILE'
+          FROM python:3.13-alpine
+          COPY . /audit/
+          RUN test -f /audit/server/web/app.js && test ! -e /audit/server/local.pem && test ! -e /audit/server/web/not-for-release/local.sqlite
+          DOCKERFILE
       - name: Validate optional DNS deployment configuration
         run: |
           docker compose --env-file .env.example config --format json > "$RUNNER_TEMP/compose-default.json"

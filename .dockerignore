@@ -1,15 +1,16 @@
-# Only ship the runtime sources. In particular, never send untracked or
-# nested local credentials, exports, logs, databases or test artefacts.
+# Deny all context files except the runtime sources listed below.
 **
 !Dockerfile
 !requirements.txt
 !server/
+server/**
 !server/__init__.py
 !server/app.py
 !server/hermes.py
 !server/notifications.py
 !server/pwa.py
 !server/web/
+server/web/**
 !server/web/app.js
 !server/web/icon-192.png
 !server/web/icon-512.png
