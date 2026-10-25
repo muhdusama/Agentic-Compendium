@@ -90,24 +90,22 @@ def canonical_delivery_json(delivery: dict[str, Any]) -> str:
     return json.dumps(delivery, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def encode_cursor(updated_at: int, delivery_id: str) -> str:
-    raw = json.dumps([updated_at, delivery_id], separators=(",", ":")).encode()
+def encode_cursor(position: int) -> str:
+    raw = json.dumps([position], separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def decode_cursor(cursor: str) -> tuple[int, str]:
+def decode_cursor(cursor: str) -> list[Any]:
+    """Return [rowid], or the legacy [updated_at, id] wall-clock cursor."""
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         value = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
-        if (
-            not isinstance(value, list)
-            or len(value) != 2
-            or not isinstance(value[0], int)
-            or not isinstance(value[1], str)
-        ):
+        if not isinstance(value, list) or not isinstance(value[0], int) or isinstance(value[0], bool):
             raise ValueError
-        return value[0], value[1]
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if len(value) == 1 or (len(value) == 2 and isinstance(value[1], str)):
+            return value
+        raise ValueError
+    except (ValueError, IndexError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValidationError("cursor is invalid") from exc
 
 
@@ -140,48 +138,51 @@ class DeliveryDatabase:
             )
 
     def ingest(self, delivery: dict[str, Any]) -> tuple[dict[str, Any], bool, int]:
+        """Store a delivery; return it, whether it was created, and its sync position."""
         payload_json = canonical_delivery_json(delivery)
         with self._lock, self._connect() as connection:
             existing = connection.execute(
-                "SELECT payload_json, updated_at FROM deliveries WHERE id = ?", (delivery["id"],)
+                "SELECT rowid, payload_json FROM deliveries WHERE id = ?", (delivery["id"],)
             ).fetchone()
             if existing is not None:
                 if existing["payload_json"] != payload_json:
                     raise ConflictError("delivery id already exists with different content")
-                return json.loads(existing["payload_json"]), False, existing["updated_at"]
+                return json.loads(existing["payload_json"]), False, existing["rowid"]
 
-            updated_at = time.time_ns()
-            connection.execute(
+            inserted = connection.execute(
                 "INSERT INTO deliveries(id, payload_json, updated_at) VALUES (?, ?, ?)",
-                (delivery["id"], payload_json, updated_at),
+                (delivery["id"], payload_json, time.time_ns()),
             )
-            return delivery, True, updated_at
+            return delivery, True, inserted.lastrowid
 
     def sync(self, cursor: str | None, limit: int) -> tuple[list[dict[str, Any]], str | None, bool]:
-        if cursor:
-            cursor_updated, cursor_id = decode_cursor(cursor)
-        else:
-            cursor_updated, cursor_id = -1, ""
-
+        # Deliveries are immutable and never deleted, so rowid orders commits even
+        # when wall-clock updated_at values tie or the clock moves backwards.
         with self._connect() as connection:
+            position = 0
+            if cursor:
+                decoded = decode_cursor(cursor)
+                if len(decoded) == 1:
+                    position = decoded[0]
+                else:
+                    # Resume a legacy wall-clock cursor just before the first row it
+                    # had not yet returned; repeats are safe because ids are idempotent.
+                    position = connection.execute(
+                        """
+                        SELECT COALESCE(MIN(rowid) - 1, (SELECT COALESCE(MAX(rowid), 0) FROM deliveries))
+                        FROM deliveries WHERE updated_at > ? OR (updated_at = ? AND id > ?)
+                        """,
+                        (decoded[0], decoded[0], decoded[1]),
+                    ).fetchone()[0]
             rows = connection.execute(
-                """
-                SELECT id, payload_json, updated_at
-                FROM deliveries
-                WHERE updated_at > ? OR (updated_at = ? AND id > ?)
-                ORDER BY updated_at ASC, id ASC
-                LIMIT ?
-                """,
-                (cursor_updated, cursor_updated, cursor_id, limit + 1),
+                "SELECT rowid, payload_json FROM deliveries WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (position, limit + 1),
             ).fetchall()
 
         has_more = len(rows) > limit
         page = rows[:limit]
         deliveries = [json.loads(row["payload_json"]) for row in page]
-        next_cursor = cursor
-        if page:
-            last = page[-1]
-            next_cursor = encode_cursor(last["updated_at"], last["id"])
+        next_cursor = encode_cursor(page[-1]["rowid"]) if page else cursor
         return deliveries, next_cursor, has_more
 
     def count(self) -> int:
@@ -311,19 +312,22 @@ def make_handler(service: DeliveryService) -> type[BaseHTTPRequestHandler]:
                     raise ValidationError("request body size is invalid")
                 payload = json.loads(self.rfile.read(length))
                 delivery = validate_delivery(payload)
-                stored, created, updated_at = service.database.ingest(delivery)
+                stored, created, position = service.database.ingest(delivery)
             except ConflictError as exc:
                 self.send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
             except (ValueError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
+            except RecursionError:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "request body is nested too deeply"})
+                return
             self.send_json(
                 HTTPStatus.CREATED if created else HTTPStatus.OK,
                 {
                     "delivery": stored,
                     "created": created,
-                    "cursor": encode_cursor(updated_at, stored["id"]),
+                    "cursor": encode_cursor(position),
                 },
             )
 
@@ -333,6 +337,13 @@ def make_handler(service: DeliveryService) -> type[BaseHTTPRequestHandler]:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     return Handler
+
+
+def check_secrets_replaced(environ: Any) -> None:
+    """Refuse to serve with the public example credentials from .env.example."""
+    for name in ("APP_READ_TOKEN", "APP_PUBLISH_TOKEN", "APP_OWNER_PASSWORD"):
+        if "replace-with" in environ.get(name, "").lower():
+            raise SystemExit(f"{name} still contains the .env.example placeholder; generate a random secret")
 
 
 def database_from_environment() -> DeliveryDatabase:
@@ -346,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=int(os.environ.get("APP_PORT", "8790")))
     args = parser.parse_args(argv)
 
+    check_secrets_replaced(os.environ)
     database = database_from_environment()
     service = DeliveryService(database, os.environ.get("APP_READ_TOKEN", ""),
                               os.environ.get("APP_PUBLISH_TOKEN", ""))

@@ -713,7 +713,7 @@ class OwnerWeb:
             self._json(handler, 400, {"error": str(exc)})
         except HermesError as exc:
             self._json(handler, 502, {"error": str(exc)})
-        except (KeyError, TypeError, IndexError, OverflowError) as exc:
+        except (KeyError, TypeError, IndexError, OverflowError, AttributeError, RecursionError) as exc:
             self._json(handler, 400, {"error": "invalid archive or request data"})
         except (OSError, sqlite3.DatabaseError) as exc:
             print(f"Compendium request failure: {type(exc).__name__}", flush=True)

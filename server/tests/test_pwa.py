@@ -266,6 +266,29 @@ class PWAServerTests(unittest.TestCase):
             published_conflict.import_archive(json.dumps(archive).encode())
         self.assertFalse(published_conflict.changes(0, 500)["changes"])
 
+    def test_malformed_import_structures_return_400_not_dropped_connections(self):
+        self.sign_in()
+        def native(name, data):
+            raw = json.dumps(data).encode()
+            return {"version": 1, "preferences": [], "drawingPreviews": [], "files": [
+                {"path": name, "contents": base64.b64encode(raw).decode(), "sha256": hashlib.sha256(raw).hexdigest()}]}
+        library = base64.b64encode(json.dumps({"version": 1, "jobRoutes": []}).encode()).decode()
+        cases = [native("personal-notes.json", {"version": 1, "notes": [{"deliveryID": 5}]}),
+                 {"version": 1, "files": [], "drawingPreviews": [],
+                  "preferences": [{"key": "compendiumChannelLibraryV1", "contents": library}]}]
+        for archive in cases:
+            code, data, _ = self.request("POST", "/app/api/import", archive)
+            self.assertEqual(code, 400, data)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        conn.request("POST", "/app/api/import", body=b"[" * 200_000,
+                     headers={"Origin": ORIGIN, "Cookie": self.cookie, "Content-Type": "application/json"})
+        self.assertEqual(conn.getresponse().status, 400); conn.close()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        conn.request("POST", "/v1/deliveries", body=b"[" * 200_000,
+                     headers={"Authorization": "Bearer publisher-only", "Content-Type": "application/json"})
+        self.assertEqual(conn.getresponse().status, 400); conn.close()
+        self.assertEqual(self.request("GET", "/app/api/sync")[1]["changes"], [])
+
     def test_export_refuses_archive_larger_than_the_import_limit(self):
         self.state.put({"sourceId": "library", "kind": "note", "key": "large", "baseVersion": 0,
                         "deleted": False, "value": {"contents": "x" * 200}})
