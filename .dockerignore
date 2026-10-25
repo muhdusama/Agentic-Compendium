@@ -1,15 +1,21 @@
-.git/
-.github/
-.env
-.env.*
-!.env.example
-data/
-backups/
-server/tests/
-__pycache__/
-*.pyc
-.DS_Store
-._*
-node_modules/
-.venv/
-*.sqlite*
+# Only ship the runtime sources. In particular, never send untracked or
+# nested local credentials, exports, logs, databases or test artefacts.
+**
+!Dockerfile
+!requirements.txt
+!server/
+!server/__init__.py
+!server/app.py
+!server/hermes.py
+!server/notifications.py
+!server/pwa.py
+!server/web/
+!server/web/app.js
+!server/web/icon-192.png
+!server/web/icon-512.png
+!server/web/icon.svg
+!server/web/index.html
+!server/web/manifest.webmanifest
+!server/web/rich-text.js
+!server/web/styles.css
+!server/web/sw.js

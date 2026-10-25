@@ -99,6 +99,8 @@ For a portable export, open **Settings → Export archive** while signed in and 
 
 Issues and pull requests are welcome. Never include real credentials, private domains, internal IP addresses, personal deliveries or production database exports in reports, screenshots or commits.
 
+Please report security vulnerabilities privately as described in [SECURITY.md](SECURITY.md), rather than posting exploit details in a public issue.
+
 **Developed and maintained by [IMUVERSE](https://imuverse.com).**
 
 If the project helps you, [Support the project](https://buymeacoffee.com/muhdusama). The same link is available in the application's lower-left footer and through GitHub's support button.
